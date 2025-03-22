@@ -187,7 +187,7 @@ func (c *Cmd) Wait() error {
 	for _, p := range c.parentPipes {
 		p.Close()
 	}
-	if c.ProcessState.Success() {
+	if !c.ProcessState.Success() {
 		return errors.New(c.ProcessState.String())
 	}
 	return nil

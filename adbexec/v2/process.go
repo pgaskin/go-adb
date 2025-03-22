@@ -76,7 +76,7 @@ func NewProcess(conn net.Conn, stdin io.Reader, stdout, stderr io.Writer) *Proce
 				}
 
 			case shellproto2.PacketStderr:
-				if stdout != nil {
+				if stderr != nil {
 					stderr.Write(data)
 				}
 			}
