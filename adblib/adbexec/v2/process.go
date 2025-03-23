@@ -246,3 +246,12 @@ func (s *ProcessState) Success() bool {
 func (s *ProcessState) Exited() bool {
 	return s != nil && s.neterr == nil
 }
+
+// ExitCode returns the exit code, or -1 if the the process ended with a network
+// error or unknown status.
+func (s *ProcessState) ExitCode() int {
+	if !s.Exited() {
+		return -1
+	}
+	return s.status
+}
