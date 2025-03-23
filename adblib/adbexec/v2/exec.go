@@ -8,10 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
-	"github.com/pgaskin/go-adb/adbserver"
-	"github.com/pgaskin/go-adb/android"
+	"github.com/pgaskin/go-adb/adb"
+	"github.com/pgaskin/go-adb/adb/adbproto/shellproto2"
 )
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/daemon/shell_service.cpp;drc=9c843a66d11d85e1f69e944f1b37314d3e47aab1;l=158
@@ -21,7 +20,7 @@ import (
 // It is designed to be similar to [os/exec.Cmd].
 type Cmd struct {
 	// Server is the ADB server to run commands on.
-	Server adbserver.Dialer
+	Server adb.Dialer
 
 	// Command is the command to execute with `/system/bin/sh -c`. If empty, an
 	// interactive shell is started (but note that this isn't usable without a
@@ -73,7 +72,7 @@ type Cmd struct {
 }
 
 // Shell returns a [Cmd] to execute command on server using the default shell.
-func Shell(server adbserver.Dialer, command string) *Cmd {
+func Shell(server adb.Dialer, command string) *Cmd {
 	return &Cmd{
 		Server:  server,
 		Command: command,
@@ -84,7 +83,7 @@ func Shell(server adbserver.Dialer, command string) *Cmd {
 //
 // The provided context will call [Process.Disconnect] on the process if it is
 // done before the command finishes normally.
-func ShellContext(ctx context.Context, server adbserver.Dialer, command string) *Cmd {
+func ShellContext(ctx context.Context, server adb.Dialer, command string) *Cmd {
 	if ctx == nil {
 		panic("nil context")
 	}
@@ -95,13 +94,13 @@ func ShellContext(ctx context.Context, server adbserver.Dialer, command string) 
 
 // Command is like [Shell], but automatically quotes arguments so it can be used
 // like [os/exec.Command].
-func Command(server adbserver.Dialer, name string, arg ...string) *Cmd {
-	return Shell(server, android.QuoteShell(append([]string{name}, arg...)...))
+func Command(server adb.Dialer, name string, arg ...string) *Cmd {
+	return Shell(server, Quote(append([]string{name}, arg...)...))
 }
 
 // CommandContext is like [Command] but includes a context like [ShellContext].
-func CommandContext(ctx context.Context, server adbserver.Dialer, name string, arg ...string) *Cmd {
-	return ShellContext(ctx, server, android.QuoteShell(append([]string{name}, arg...)...))
+func CommandContext(ctx context.Context, server adb.Dialer, name string, arg ...string) *Cmd {
+	return ShellContext(ctx, server, Quote(append([]string{name}, arg...)...))
 }
 
 // Run runs the command and waits for it to finish.
@@ -124,20 +123,21 @@ func (c *Cmd) Run() error {
 // Upon returning, cmd.Process will be set.
 func (c *Cmd) Start() error {
 	if c.Process != nil {
-		return errors.New("adbshell2: already started")
+		return errors.New("adbexec: already started")
 	}
 	if c.Server == nil {
-		return fmt.Errorf("no adb server provided")
-	}
-	if strings.ContainsAny(c.Term, ",:") {
-		return fmt.Errorf("term contains illegal characters")
+		return fmt.Errorf("adbexec: no adb server provided")
 	}
 
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn, err := c.Server.DialADB(ctx, c.Service())
+	svc, err := c.Service()
+	if err != nil {
+		return err
+	}
+	conn, err := c.Server.DialADB(ctx, svc)
 	if err != nil {
 		return err
 	}
@@ -155,21 +155,22 @@ func (c *Cmd) Start() error {
 }
 
 // Service returns the ADB service which will be run when c is started.
-func (c *Cmd) Service() string {
-	var svc strings.Builder
-	svc.WriteString("shell,v2")
+func (c *Cmd) Service() (string, error) {
+	var b shellproto2.ServiceBuilder
 	if c.Term != "" {
-		svc.WriteString(",TERM=")
-		svc.WriteString(c.Term)
+		if !b.Term(c.Term) {
+			return "", fmt.Errorf("term contains illegal character")
+		}
 	}
 	if c.PTY {
-		svc.WriteString(",pty")
+		b.PTY()
 	} else {
-		svc.WriteString(",raw")
+		b.Raw()
 	}
-	svc.WriteString(":")
-	svc.WriteString(c.Command)
-	return svc.String()
+	if c.Command != "" {
+		b.Command(c.Command)
+	}
+	return b.String(), nil
 }
 
 // Wait waits for the command to complete, returning an error if the command was
@@ -178,10 +179,10 @@ func (c *Cmd) Service() string {
 // Upon returning, cmd.ProcessState will be set.
 func (c *Cmd) Wait() error {
 	if c.Process == nil {
-		return errors.New("adbshell2: not started")
+		return errors.New("adbexec: not started")
 	}
 	if c.ProcessState != nil {
-		return errors.New("adbshell2: Wait already called")
+		return errors.New("adbexec: Wait already called")
 	}
 	c.ProcessState = c.Process.Wait()
 	for _, p := range c.parentPipes {
@@ -202,10 +203,10 @@ func (c *Cmd) Wait() error {
 // until standard input is closed, the caller must close the pipe.
 func (c *Cmd) StdinPipe() (io.WriteCloser, error) {
 	if c.Stdin != nil {
-		return nil, errors.New("adbshell2: Stdin already set")
+		return nil, errors.New("adbexec: Stdin already set")
 	}
 	if c.Process != nil {
-		return nil, errors.New("adbshell2: StdinPipe after process started")
+		return nil, errors.New("adbexec: StdinPipe after process started")
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -228,10 +229,10 @@ func (c *Cmd) StdinPipe() (io.WriteCloser, error) {
 // See the StdoutPipe example in [os/exec].
 func (c *Cmd) StdoutPipe() (io.ReadCloser, error) {
 	if c.Stdout != nil {
-		return nil, errors.New("adbshell2: Stdout already set")
+		return nil, errors.New("adbexec: Stdout already set")
 	}
 	if c.Process != nil {
-		return nil, errors.New("adbshell2: StdoutPipe after process started")
+		return nil, errors.New("adbexec: StdoutPipe after process started")
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -254,10 +255,10 @@ func (c *Cmd) StdoutPipe() (io.ReadCloser, error) {
 // See the StderrPipe example in [os/exec].
 func (c *Cmd) StderrPipe() (io.ReadCloser, error) {
 	if c.Stderr != nil {
-		return nil, errors.New("adbshell2: Stderr already set")
+		return nil, errors.New("adbexec: Stderr already set")
 	}
 	if c.Process != nil {
-		return nil, errors.New("adbshell2: StderrPipe after process started")
+		return nil, errors.New("adbexec: StderrPipe after process started")
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {

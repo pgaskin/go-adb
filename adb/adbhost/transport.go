@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pgaskin/go-adb/adbserver"
+	"github.com/pgaskin/go-adb/adb"
 )
 
 // Transport selects an ADB server to connect to via a host server.
@@ -84,7 +84,7 @@ type serverDialerConn struct {
 // The [TransportID] selected by the ADB host for a connection can be retrieved
 // using [ServerConnTransportID] to allow the same device to be connected to
 // later (e.g., after "adb root").
-func Server(d *Dialer, t Transport) adbserver.Dialer {
+func Server(d *Dialer, t Transport) adb.Dialer {
 	if d == nil {
 		d = new(Dialer)
 	}

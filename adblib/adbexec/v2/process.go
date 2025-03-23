@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/pgaskin/go-adb/adbsvc/shellproto2"
+	"github.com/pgaskin/go-adb/adb/adbproto/shellproto2"
 )
 
 // Process represents an established shell v2 connection.

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 )
 
@@ -134,4 +135,60 @@ func (c *Conn) setError(err error) {
 	if c.errd.CompareAndSwap(false, true) {
 		c.err = fmt.Errorf("write: %w", err)
 	}
+}
+
+// ServiceBuilder builds a service name for shell v2.
+//
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/daemon/services.cpp;l=86-123;drc=9c843a66d11d85e1f69e944f1b37314d3e47aab1
+type ServiceBuilder struct {
+	term string
+	raw  bool
+	pty  bool
+	cmd  string
+}
+
+// Raw disables pty allocation.
+func (s *ServiceBuilder) Raw() {
+	s.pty = false
+	s.raw = true
+}
+
+// PTY enables pty allocation.
+func (s *ServiceBuilder) PTY() {
+	s.pty = true
+	s.raw = false
+}
+
+// Term sets the TERM environment variable. If invalid, it is not set, and false
+// is returned.
+func (s *ServiceBuilder) Term(term string) bool {
+	ok := !strings.ContainsAny(term, ",:")
+	if ok {
+		s.term = term
+	}
+	return ok
+}
+
+// Command sets the command to execute. If not set, an interactive shell is
+// started.
+func (s *ServiceBuilder) Command(cmd string) {
+	s.cmd = cmd
+}
+
+// String builds the service name.
+func (s *ServiceBuilder) String() string {
+	var b strings.Builder
+	b.WriteString("shell,v2")
+	if s.term != "" {
+		b.WriteString(",TERM=" + s.term)
+	}
+	if s.pty {
+		b.WriteString(",pty")
+	}
+	if s.pty {
+		b.WriteString(",raw")
+	}
+	b.WriteString(":")
+	b.WriteString(s.cmd)
+	return b.String()
 }

@@ -1,5 +1,5 @@
-// Package adbserver interacts with an ADB server on a device.
-package adbserver
+// Package adb interacts with ADB servers.
+package adb
 
 import (
 	"context"
