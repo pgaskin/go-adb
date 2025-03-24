@@ -17,8 +17,6 @@ package jdwp
 import (
 	"fmt"
 	"reflect"
-
-	"github.com/google/gapid/core/data/binary"
 )
 
 // debug adds panic handlers to encode() and decode() so that incorrectly
@@ -33,11 +31,11 @@ func unbox(v reflect.Value) reflect.Value {
 }
 
 // encode writes the value v to w, using the JDWP encoding scheme.
-func (c *Connection) encode(w binary.Writer, v reflect.Value) error {
+func (c *Connection) encode(w Writer, v reflect.Value) error {
 	if debug {
 		defer func() {
 			if r := recover(); r != nil {
-				panic(fmt.Errorf("Type %T %v %v", v.Interface(), v.Type().Name(), v.Kind()))
+				panic(fmt.Errorf("type %T %v %v", v.Interface(), v.Type().Name(), v.Kind()))
 			}
 		}()
 	}
@@ -86,22 +84,22 @@ func (c *Connection) encode(w binary.Writer, v reflect.Value) error {
 		case ClassObjectID:
 			w.Uint8(uint8(TagClassObject))
 		default:
-			panic(fmt.Errorf("Got Value of type %T", o))
+			panic(fmt.Errorf("got Value of type %T", o))
 		}
 	}
 
 	switch o := o.(type) {
 	case ReferenceTypeID, ClassID, InterfaceID, ArrayTypeID:
-		binary.WriteUint(w, c.idSizes.ReferenceTypeIDSize*8, unbox(v).Uint())
+		WriteUint(w, c.idSizes.ReferenceTypeIDSize*8, unbox(v).Uint())
 
 	case MethodID:
-		binary.WriteUint(w, c.idSizes.MethodIDSize*8, unbox(v).Uint())
+		WriteUint(w, c.idSizes.MethodIDSize*8, unbox(v).Uint())
 
 	case FieldID:
-		binary.WriteUint(w, c.idSizes.FieldIDSize*8, unbox(v).Uint())
+		WriteUint(w, c.idSizes.FieldIDSize*8, unbox(v).Uint())
 
 	case ObjectID, ThreadID, ThreadGroupID, StringID, ClassLoaderID, ClassObjectID, ArrayID:
-		binary.WriteUint(w, c.idSizes.ObjectIDSize*8, unbox(v).Uint())
+		WriteUint(w, c.idSizes.ObjectIDSize*8, unbox(v).Uint())
 
 	case []byte: // Optimisation
 		w.Uint32(uint32(len(o)))
@@ -143,18 +141,18 @@ func (c *Connection) encode(w binary.Writer, v reflect.Value) error {
 				c.encode(w, v.Index(i))
 			}
 		default:
-			panic(fmt.Errorf("Unhandled type %T %v %v", o, t.Name(), t.Kind()))
+			panic(fmt.Errorf("unhandled type %T %v %v", o, t.Name(), t.Kind()))
 		}
 	}
 	return w.Error()
 }
 
 // decode reads the value v from r, using the JDWP encoding scheme.
-func (c *Connection) decode(r binary.Reader, v reflect.Value) error {
+func (c *Connection) decode(r Reader, v reflect.Value) error {
 	if debug {
 		defer func() {
 			if r := recover(); r != nil {
-				panic(fmt.Errorf("Type %T %v %v", v.Interface(), v.Type().Name(), v.Kind()))
+				panic(fmt.Errorf("type %T %v %v", v.Interface(), v.Type().Name(), v.Kind()))
 			}
 		}()
 	}
@@ -208,7 +206,7 @@ func (c *Connection) decode(r binary.Reader, v reflect.Value) error {
 			v.Set(reflect.New(v.Type()).Elem())
 			return r.Error()
 		default:
-			panic(fmt.Errorf("Unhandled value type %v", tag))
+			panic(fmt.Errorf("unhandled value type %v", tag))
 		}
 		data := reflect.New(ty).Elem()
 		c.decode(r, data)
@@ -220,16 +218,16 @@ func (c *Connection) decode(r binary.Reader, v reflect.Value) error {
 	o := v.Interface()
 	switch o := o.(type) {
 	case ReferenceTypeID, ClassID, InterfaceID, ArrayTypeID:
-		v.Set(reflect.ValueOf(binary.ReadUint(r, c.idSizes.ReferenceTypeIDSize*8)).Convert(t))
+		v.Set(reflect.ValueOf(ReadUint(r, c.idSizes.ReferenceTypeIDSize*8)).Convert(t))
 
 	case MethodID:
-		v.Set(reflect.ValueOf(binary.ReadUint(r, c.idSizes.MethodIDSize*8)).Convert(t))
+		v.Set(reflect.ValueOf(ReadUint(r, c.idSizes.MethodIDSize*8)).Convert(t))
 
 	case FieldID:
-		v.Set(reflect.ValueOf(binary.ReadUint(r, c.idSizes.FieldIDSize*8)).Convert(t))
+		v.Set(reflect.ValueOf(ReadUint(r, c.idSizes.FieldIDSize*8)).Convert(t))
 
 	case ObjectID, ThreadID, ThreadGroupID, StringID, ClassLoaderID, ClassObjectID, ArrayID:
-		v.Set(reflect.ValueOf(binary.ReadUint(r, c.idSizes.ObjectIDSize*8)).Convert(t))
+		v.Set(reflect.ValueOf(ReadUint(r, c.idSizes.ObjectIDSize*8)).Convert(t))
 
 	case EventModifier:
 		panic("Cannot decode EventModifiers")
@@ -268,7 +266,7 @@ func (c *Connection) decode(r binary.Reader, v reflect.Value) error {
 			}
 			v.Set(slice)
 		default:
-			panic(fmt.Errorf("Unhandled type %T %v %v", o, t.Name(), t.Kind()))
+			panic(fmt.Errorf("unhandled type %T %v %v", o, t.Name(), t.Kind()))
 		}
 	}
 	return r.Error()

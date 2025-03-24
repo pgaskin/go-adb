@@ -28,7 +28,8 @@ func (c *Connection) GetThisObject(thread ThreadID, frame FrameID) (TaggedObject
 
 type VariableRequest struct {
 	Index int
-	Tag   uint8
+	// Tag   uint8
+	Tag Tag
 }
 
 // GetValues returns the set of objects for the specified thread and frame,

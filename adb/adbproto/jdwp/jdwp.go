@@ -24,11 +24,6 @@ import (
 	"reflect"
 	"sync"
 	"time"
-
-	"github.com/google/gapid/core/app/crash"
-	"github.com/google/gapid/core/data/binary"
-	"github.com/google/gapid/core/data/endian"
-	"github.com/google/gapid/core/os/device"
 )
 
 var (
@@ -46,8 +41,8 @@ var (
 // Connection represents a JDWP connection.
 type Connection struct {
 	in           io.Reader
-	r            binary.Reader
-	w            binary.Writer
+	r            Reader
+	w            Writer
 	flush        func() error
 	idSizes      IDSizes
 	nextPacketID packetID
@@ -63,8 +58,8 @@ func Open(ctx context.Context, conn io.ReadWriteCloser) (*Connection, error) {
 	}
 
 	buf := bufio.NewWriterSize(conn, 1024)
-	r := endian.Reader(conn, device.BigEndian)
-	w := endian.Writer(buf, device.BigEndian)
+	r := ByteOrderReader(conn, BigEndian)
+	w := ByteOrderWriter(buf, BigEndian)
 	c := &Connection{
 		in:      conn,
 		r:       r,
@@ -75,7 +70,8 @@ func Open(ctx context.Context, conn io.ReadWriteCloser) (*Connection, error) {
 		replies: map[packetID]chan<- replyPacket{},
 	}
 
-	crash.Go(func() { c.recv(ctx) })
+	// crash.Go(func() { c.recv(ctx) })
+	go c.recv(ctx)
 	var err error
 	c.idSizes, err = c.GetIDSizes()
 	if err != nil {
@@ -93,7 +89,7 @@ func exchangeHandshakes(conn io.ReadWriter) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("Bad handshake")
+		return fmt.Errorf("bad handshake")
 	}
 	return nil
 }
@@ -130,7 +126,7 @@ func (c *Connection) get(cmd cmd, req interface{}, out interface{}) error {
 func (c *Connection) req(cmd cmd, req interface{}) (*pending, error) {
 	data := bytes.Buffer{}
 	if req != nil {
-		e := endian.Writer(&data, device.BigEndian)
+		e := ByteOrderWriter(&data, BigEndian)
 		if err := c.encode(e, reflect.ValueOf(req)); err != nil {
 			return nil, err
 		}
@@ -174,13 +170,13 @@ func (p *pending) wait(out interface{}) error {
 			return nil
 		}
 		r := bytes.NewReader(reply.data)
-		d := endian.Reader(r, device.BigEndian)
+		d := ByteOrderReader(r, BigEndian)
 		if err := p.c.decode(d, reflect.ValueOf(out)); err != nil {
 			return err
 		}
 		dbg("<%v> recv: %+v", p.id, out)
 		if offset, _ := r.Seek(0, 1); offset != int64(len(reply.data)) {
-			panic(fmt.Errorf("Only %d/%d bytes read from reply packet", offset, len(reply.data)))
+			panic(fmt.Errorf("only %d/%d bytes read from reply packet", offset, len(reply.data)))
 		}
 		return nil
 	case <-time.After(time.Second * 120):

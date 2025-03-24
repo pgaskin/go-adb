@@ -17,7 +17,7 @@ package jdwp
 import "fmt"
 
 func dbg(msg string, args ...interface{}) {
-	const enabled = false
+	const enabled = true
 	if enabled {
 		fmt.Println(fmt.Sprintf(msg, args...))
 	}

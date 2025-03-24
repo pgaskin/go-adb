@@ -16,8 +16,6 @@ package jdwp
 
 import (
 	"fmt"
-
-	"github.com/google/gapid/core/data/binary"
 )
 
 type packetID uint32
@@ -53,7 +51,7 @@ type cmdPacket struct {
 //   data   []byte       N bytes
 // }
 
-func (p cmdPacket) write(w binary.Writer) error {
+func (p cmdPacket) write(w Writer) error {
 	w.Uint32(11 + uint32(len(p.data)))
 	w.Uint32(uint32(p.id))
 	w.Uint8(uint8(p.flags))
@@ -75,7 +73,7 @@ func (c *Connection) readPacket() (interface{}, error) {
 		return nil, err
 	}
 	if len < 11 {
-		return replyPacket{}, fmt.Errorf("Packet length too short (%d)", len)
+		return replyPacket{}, fmt.Errorf("packet length too short (%d)", len)
 	}
 	id := packetID(c.r.Uint32())
 	flags := packetFlags(c.r.Uint8())

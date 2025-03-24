@@ -19,11 +19,6 @@ import (
 	"context"
 	"io"
 	"reflect"
-
-	"github.com/google/gapid/core/data/endian"
-	"github.com/google/gapid/core/event/task"
-	"github.com/google/gapid/core/log"
-	"github.com/google/gapid/core/os/device"
 )
 
 // recv decodes all the incoming reply or command packets, forwarding them on
@@ -31,15 +26,15 @@ import (
 // go routine.
 // recv returns when ctx is stopped or there's an IO error.
 func (c *Connection) recv(ctx context.Context) {
-	for !task.Stopped(ctx) {
+	for ctx.Err() == nil {
 		packet, err := c.readPacket()
 		switch err {
 		case nil:
 		case io.EOF:
 			return
 		default:
-			if !task.Stopped(ctx) {
-				log.W(ctx, "Failed to read packet. Error: %v", err)
+			if ctx.Err() == nil {
+				//fmt.Printf("Failed to read packet. Error: %v\n", err)
 			}
 			return
 		}
@@ -51,7 +46,7 @@ func (c *Connection) recv(ctx context.Context) {
 			delete(c.replies, packet.id)
 			c.Unlock()
 			if !ok {
-				log.W(ctx, "Unexpected reply for packet %d", packet.id)
+				//fmt.Printf("Unexpected reply for packet %d\n", packet.id)
 				continue
 			}
 			out <- packet
@@ -59,10 +54,10 @@ func (c *Connection) recv(ctx context.Context) {
 		case cmdPacket:
 			switch {
 			case packet.cmdSet == cmdSetEvent && packet.cmdID == cmdCompositeEvent:
-				d := endian.Reader(bytes.NewReader(packet.data), device.BigEndian)
+				d := ByteOrderReader(bytes.NewReader(packet.data), BigEndian)
 				l := events{}
 				if err := c.decode(d, reflect.ValueOf(&l)); err != nil {
-					log.F(ctx, true, "Couldn't decode composite event data. Error: %v", err)
+					//fmt.Printf("Couldn't decode composite event data. Error: %v\n", err)
 					continue
 				}
 

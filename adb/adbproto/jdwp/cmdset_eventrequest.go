@@ -17,8 +17,6 @@ package jdwp
 import (
 	"context"
 	"fmt"
-
-	"github.com/google/gapid/core/event/task"
 )
 
 // EventRequestID is an identifier of an event request.
@@ -74,7 +72,7 @@ run: // Consume events until the handler returns false or the context is cancell
 			if !handler(event) {
 				break run
 			}
-		case <-task.ShouldStop(ctx):
+		case <-ctx.Done():
 			break run
 		}
 	}
