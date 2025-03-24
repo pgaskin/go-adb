@@ -38,7 +38,7 @@ func (c *Dialer) DialADBHost(ctx context.Context, svc string) (net.Conn, error) 
 	}
 	conn, err := dc(ctx, "tcp", cmp.Or(c.Addr, DefaultAddr))
 	if err != nil {
-		return conn, nil
+		return nil, err
 	}
 	if err := adbService(ctx, conn, svc); err != nil {
 		conn.Close()
