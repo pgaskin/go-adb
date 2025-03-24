@@ -9,6 +9,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/pgaskin/go-adb/adb"
 )
@@ -71,6 +73,7 @@ func (t DefaultTransport) hostPrefix() string {
 type serverDialer struct {
 	d *Dialer
 	t Transport
+	k atomic.Pointer[sync.Mutex]
 }
 
 type serverDialerConn struct {
@@ -90,10 +93,32 @@ func Server(d *Dialer, t Transport) adb.Dialer {
 	if d == nil {
 		d = new(Dialer)
 	}
-	return &serverDialer{d, t}
+	return &serverDialer{d: d, t: t}
+}
+
+// StickyServer is like [Server], but will pin the transport id after the first
+// connection.
+//
+// This is useful for things which may open a pool of connections to the same
+// device.
+//
+// Note that a USB disconnection and reconnection will change the transport id.
+func StickyServer(d *Dialer, t Transport) adb.Dialer {
+	s := Server(d, t).(*serverDialer)
+	if _, ok := t.(TransportID); !ok {
+		s.k.Store(new(sync.Mutex))
+	}
+	return s
 }
 
 func (h *serverDialer) DialADB(ctx context.Context, svc string) (net.Conn, error) {
+	var sticking bool
+	if m := h.k.Load(); m != nil {
+		// we're sticky, but we don't have a pinned transport id yet
+		m.Lock()
+		defer m.Unlock()
+		sticking = true
+	}
 	hostPrefix := h.t.hostPrefix()
 	if hostPrefix == "" {
 		return nil, errors.New("invalid transport")
@@ -103,7 +128,7 @@ func (h *serverDialer) DialADB(ctx context.Context, svc string) (net.Conn, error
 		return nil, err
 	}
 	tid, ok := h.t.(TransportID)
-	if isLegacy := !strings.HasPrefix(hostPrefix, "host:tport:"); !isLegacy {
+	if isLegacy := !strings.HasPrefix(hostPrefix, "host:tport:"); !ok && !isLegacy {
 		buf := make([]byte, 8)
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			conn.Close()
@@ -113,6 +138,11 @@ func (h *serverDialer) DialADB(ctx context.Context, svc string) (net.Conn, error
 	}
 	var tidPtr *TransportID
 	if ok {
+		if sticking {
+			// we don't need the mutex once we have pinned the transport id
+			h.k.Store(nil)
+			h.t = tid
+		}
 		tidPtr = &tid
 	}
 	if err := adbService(ctx, conn, svc); err != nil {
