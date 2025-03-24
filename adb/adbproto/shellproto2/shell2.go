@@ -185,7 +185,7 @@ func (s *ServiceBuilder) String() string {
 	if s.pty {
 		b.WriteString(",pty")
 	}
-	if s.pty {
+	if s.raw {
 		b.WriteString(",raw")
 	}
 	b.WriteString(":")
