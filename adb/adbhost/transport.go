@@ -66,6 +66,8 @@ func (t DefaultTransport) hostPrefix() string {
 	return "host:tport:" + string(t)
 }
 
+// TODO: emulator
+
 type serverDialer struct {
 	d *Dialer
 	t Transport
