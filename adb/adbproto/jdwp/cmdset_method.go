@@ -25,3 +25,13 @@ func (c *Connection) VariableTable(classTy ReferenceTypeID, method MethodID) (Va
 	err := c.get(cmdMethodTypeVariableTable, req, &res)
 	return res, err
 }
+
+func (c *Connection) LineTable(classTy ReferenceTypeID, method MethodID) (LineTable, error) {
+	req := struct {
+		Class  ReferenceTypeID
+		Method MethodID
+	}{classTy, method}
+	var res LineTable
+	err := c.get(cmdMethodTypeLineTable, req, &res)
+	return res, err
+}
