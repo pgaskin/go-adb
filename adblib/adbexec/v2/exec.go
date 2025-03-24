@@ -69,6 +69,9 @@ type Cmd struct {
 	ctx         context.Context
 	parentPipes []io.Closer
 	childPipes  []io.Closer
+	setupTTY    func() error // [Cmd.HostTTY]
+	startTTY    func()       // [Cmd.HostTTY]
+	cleanupTTY  func()       // [Cmd.HostTTY]
 }
 
 // Shell returns a [Cmd] to execute command on server using the default shell.
@@ -137,6 +140,11 @@ func (c *Cmd) Start() error {
 	if err != nil {
 		return err
 	}
+	if c.setupTTY != nil {
+		if err := c.setupTTY(); err != nil {
+			return fmt.Errorf("setup host tty: %w", err)
+		}
+	}
 	conn, err := c.Server.DialADB(ctx, svc)
 	if err != nil {
 		return err
@@ -148,6 +156,9 @@ func (c *Cmd) Start() error {
 			p.Close()
 		}
 	}()
+	if c.startTTY != nil {
+		c.startTTY()
+	}
 	context.AfterFunc(ctx, func() {
 		c.Process.Disconnect()
 	})
@@ -187,6 +198,9 @@ func (c *Cmd) Wait() error {
 	c.ProcessState = c.Process.Wait()
 	for _, p := range c.parentPipes {
 		p.Close()
+	}
+	if c.cleanupTTY != nil {
+		c.cleanupTTY()
 	}
 	if !c.ProcessState.Success() {
 		return errors.New(c.ProcessState.String())
