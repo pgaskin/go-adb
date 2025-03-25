@@ -202,18 +202,22 @@ func (h *TransportDialer) TransportID() (TransportID, bool) {
 	return TransportID(0), false
 }
 
-// SupportsFeature returns true if the cached list of supported features
-// contains the specified feature. If [TransportDialer.LoadFeatures] has not been
-// called, this will always return false.
+// SupportsFeature returns true if the transport supports the provided feature.
+// This is the intersection of the features supported by the transport and the
+// features supported by the host server. If [TransportDialer.LoadFeatures] or
+// [Dialer.LoadFeatures] have not been called, this will always return false.
 func (h *TransportDialer) SupportsFeature(f adbproto.Feature) bool {
-	if fm := h.f.Load(); fm != nil {
-		_, ok := (*fm)[f]
-		return ok
+	if h.d.SupportsFeature(f) {
+		if fm := h.f.Load(); fm != nil {
+			_, ok := (*fm)[f]
+			return ok
+		}
 	}
 	return false
 }
 
-// LoadFeatures updates the list of supported optional features.
+// LoadFeatures updates the list of supported optional features. Note that you
+// also need to call [Dialer.LoadFeatures] if you haven't already done so.
 func (h *TransportDialer) LoadFeatures(ctx context.Context) error {
 	conn, err := h.DialADBHostTransport(ctx, "features")
 	if err != nil {
@@ -235,14 +239,18 @@ func (h *TransportDialer) LoadFeatures(ctx context.Context) error {
 	return nil
 }
 
-// Features returns all supported features. If [TransportDialer.LoadFeatures] has
-// not been called, this will always return an empty iterator.
+// Features returns all supported features. This is the intersection of the
+// features supported by the transport and the features supported by the host
+// server. If [TransportDialer.LoadFeatures] or [Dialer.LoadFeatures] have not
+// been called, this will always return false.
 func (h *TransportDialer) Features() iter.Seq[adbproto.Feature] {
 	return func(yield func(adbproto.Feature) bool) {
 		if fm := h.f.Load(); fm != nil {
 			for f := range *fm {
-				if !yield(f) {
-					return
+				if h.d.SupportsFeature(f) {
+					if !yield(f) {
+						return
+					}
 				}
 			}
 		}
