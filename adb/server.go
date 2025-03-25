@@ -3,6 +3,8 @@ package adb
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 
 	"github.com/pgaskin/go-adb/adb/adbproto"
@@ -21,11 +23,28 @@ type Features interface {
 	SupportsFeature(f adbproto.Feature) bool
 }
 
-// SupportsFeature returns true if the dialer implements [Features] and supports
-// the specified feature.
-func SupportsFeature(d Dialer, f adbproto.Feature) bool {
+// ErrFeatureNotSupported is returned by [SupportsFeature].
+var ErrFeatureNotSupported = errors.New("feature not supported")
+
+// SupportsFeature returns nil if the dialer implements [Features] and supports
+// the specified feature, or returns an error matching [ErrFeatureNotSupported].
+func SupportsFeature(d Dialer, f adbproto.Feature) error {
 	if df, ok := d.(Features); ok && df != nil {
-		return df.SupportsFeature(f)
+		if df.SupportsFeature(f) {
+			return nil
+		}
 	}
-	return false
+	return &featureNotSupportedError{f}
+}
+
+type featureNotSupportedError struct {
+	Feature adbproto.Feature
+}
+
+func (e *featureNotSupportedError) Error() string {
+	return fmt.Sprintf("feature %q not supported", e.Feature)
+}
+
+func (e *featureNotSupportedError) Is(target error) bool {
+	return target == ErrFeatureNotSupported || target == errors.ErrUnsupported
 }
