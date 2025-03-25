@@ -54,7 +54,6 @@ var (
 // prevent additional connections from being opened unnecessarily.
 type FS struct {
 	server    adb.Dialer
-	feat      map[string]struct{}
 	timeout   time.Duration
 	keepalive time.Duration
 	connMu    sync.Mutex
@@ -80,16 +79,6 @@ func (fn optionFunc) apply(fs *FS) {
 	}
 }
 
-// WithFeatures enables optional sync protocol features. Unknown features will
-// be ignored.
-func WithFeatures(feat ...string) Option {
-	return optionFunc(func(fs *FS) {
-		for _, x := range feat {
-			fs.feat[x] = struct{}{}
-		}
-	})
-}
-
 // WithTimeout sets a timeout for connections to be established. If not set,
 // file operations may block indefinitely.
 func WithTimeout(t time.Duration) Option {
@@ -110,7 +99,6 @@ func WithKeepalive(t time.Duration) Option {
 func Connect(server adb.Dialer, opt ...Option) (*FS, error) {
 	c := &FS{
 		server: server,
-		feat:   make(map[string]struct{}),
 		conn:   make(map[net.Conn]func() bool),
 	}
 	for _, opt := range opt {
