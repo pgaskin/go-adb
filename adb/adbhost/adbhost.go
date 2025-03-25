@@ -2,7 +2,6 @@
 package adbhost
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -18,6 +17,8 @@ import (
 var DefaultAddr = "localhost:5037"
 
 // Dialer connects to an ADB host server.
+//
+// A nil Dialer will act the same way as an zero Dialer.
 type Dialer struct {
 	// DialContext is the function used to open the TCP connection. If nil,
 	// the default [net.Dialer]'s DialContext is used.
@@ -32,11 +33,19 @@ type Dialer struct {
 // time to establish the tcp connection and receive the OKAY completing the
 // service connection.
 func (c *Dialer) DialADBHost(ctx context.Context, svc string) (net.Conn, error) {
-	dc := c.DialContext
-	if dc == nil {
+	var dc func(ctx context.Context, network, addr string) (net.Conn, error)
+	if c != nil && c.DialContext != nil {
+		dc = c.DialContext
+	} else {
 		dc = new(net.Dialer).DialContext
 	}
-	conn, err := dc(ctx, "tcp", cmp.Or(c.Addr, DefaultAddr))
+	var addr string
+	if c != nil && c.Addr != "" {
+		addr = c.Addr
+	} else {
+		addr = DefaultAddr
+	}
+	conn, err := dc(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}

@@ -90,9 +90,6 @@ type serverDialerConn struct {
 // using [ServerConnTransportID] to allow the same device to be connected to
 // later (e.g., after "adb root").
 func Server(d *Dialer, t Transport) adb.Dialer {
-	if d == nil {
-		d = new(Dialer)
-	}
 	return &serverDialer{d: d, t: t}
 }
 
