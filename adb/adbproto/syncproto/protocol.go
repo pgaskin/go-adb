@@ -1,4 +1,3 @@
-// Package syncproto implements the sync protocol.
 package syncproto
 
 import (
@@ -6,18 +5,20 @@ import (
 	"fmt"
 	"io"
 	"net"
+
+	"github.com/pgaskin/go-adb/adb/adbproto"
 )
 
 // TODO: optimize, refactor
 
 const (
-	Feature_stat_v2                  string = "stat_v2"
-	Feature_ls_v2                    string = "ls_v2"
-	Feature_sendrecv_v2              string = "sendrecv_v2"
-	Feature_sendrecv_v2_brotli       string = "sendrecv_v2_brotli"
-	Feature_sendrecv_v2_lz4          string = "sendrecv_v2_lz4"
-	Feature_sendrecv_v2_zstd         string = "sendrecv_v2_zstd"
-	Feature_sendrecv_v2_dry_run_send string = "sendrecv_v2_dry_run_send"
+	Feature_stat_v2                  = adbproto.FeatureStat2
+	Feature_ls_v2                    = adbproto.FeatureLs2
+	Feature_sendrecv_v2              = adbproto.FeatureSendRecv2
+	Feature_sendrecv_v2_brotli       = adbproto.FeatureSendRecv2Brotli
+	Feature_sendrecv_v2_lz4          = adbproto.FeatureSendRecv2LZ4
+	Feature_sendrecv_v2_zstd         = adbproto.FeatureSendRecv2Zstd
+	Feature_sendrecv_v2_dry_run_send = adbproto.FeatureSendRecv2DryRunSend
 )
 
 type PacketID [4]byte
