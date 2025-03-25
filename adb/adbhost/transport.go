@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/pgaskin/go-adb/adb"
 )
 
 // Transport selects an ADB server to connect to via a host server.
@@ -86,7 +84,7 @@ func (t DefaultTransport) transport() string {
 
 // TODO: emulator
 
-type serverDialer struct {
+type ServerDialer struct {
 	d *Dialer
 	t Transport
 	k atomic.Pointer[sync.Mutex]
@@ -105,8 +103,8 @@ type serverDialerConn struct {
 // The [TransportID] selected by the ADB host for a connection can be retrieved
 // using [ServerConnTransportID] to allow the same device to be connected to
 // later (e.g., after "adb root").
-func Server(d *Dialer, t Transport) adb.Dialer {
-	return &serverDialer{d: d, t: t}
+func Server(d *Dialer, t Transport) *ServerDialer {
+	return &ServerDialer{d: d, t: t}
 }
 
 // StickyServer is like [Server], but will pin the transport id after the first
@@ -116,15 +114,16 @@ func Server(d *Dialer, t Transport) adb.Dialer {
 // device.
 //
 // Note that a USB disconnection and reconnection will change the transport id.
-func StickyServer(d *Dialer, t Transport) adb.Dialer {
-	s := Server(d, t).(*serverDialer)
+func StickyServer(d *Dialer, t Transport) *ServerDialer {
+	s := Server(d, t)
 	if _, ok := t.(TransportID); !ok {
 		s.k.Store(new(sync.Mutex))
 	}
 	return s
 }
 
-func (h *serverDialer) DialADB(ctx context.Context, svc string) (net.Conn, error) {
+// DialADB opens a connection to svc on the transport.
+func (h *ServerDialer) DialADB(ctx context.Context, svc string) (net.Conn, error) {
 	var sticking bool
 	if m := h.k.Load(); m != nil {
 		// we're sticky, but we don't have a pinned transport id yet
@@ -163,6 +162,31 @@ func (h *serverDialer) DialADB(ctx context.Context, svc string) (net.Conn, error
 		return nil, err
 	}
 	return &serverDialerConn{conn, tidPtr}, nil
+}
+
+// DialADBHostTransport opens a connection to the host svc for the transport.
+func (h *ServerDialer) DialADBHostTransport(ctx context.Context, svc string) (net.Conn, error) {
+	if m := h.k.Load(); m != nil {
+		// we're sticky, but we don't have a pinned transport id yet
+		m.Lock()
+		defer m.Unlock()
+	}
+	t := h.t
+	if tid, ok := h.t.(TransportID); ok {
+		t = tid
+	}
+	return h.d.DialADBHost(ctx, t.hostPrefix()+":"+svc)
+}
+
+// TransportID returns the transport ID if the dialer was created with a
+// TransportID or after the first [DialADB] when created with [StickyServer].
+func (h *ServerDialer) TransportID() (TransportID, bool) {
+	if h.k.Load() == nil {
+		if tid, ok := h.t.(TransportID); ok {
+			return tid, true
+		}
+	}
+	return TransportID(0), false
 }
 
 // ServerConnTransportID gets the TransportID from a conn opened via [Host] if
