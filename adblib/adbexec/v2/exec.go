@@ -3,11 +3,13 @@
 package adbexec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 
 	"github.com/pgaskin/go-adb/adb"
 	"github.com/pgaskin/go-adb/adb/adbproto/shellproto2"
@@ -203,7 +205,7 @@ func (c *Cmd) Wait() error {
 		c.cleanupTTY()
 	}
 	if !c.ProcessState.Success() {
-		return errors.New(c.ProcessState.String())
+		return &ExitError{ProcessState: c.ProcessState}
 	}
 	return nil
 }
@@ -284,4 +286,137 @@ func (c *Cmd) StderrPipe() (io.ReadCloser, error) {
 	return pr, nil
 }
 
-// TODO: more helpers like os/exec.Cmd
+// Output runs the command and returns its standard output.
+// Any returned error will usually be of type [*ExitError].
+// If c.Stderr was nil and the returned error is of type
+// [*ExitError], Output populates the Stderr field of the
+// returned error.
+func (c *Cmd) Output() ([]byte, error) {
+	if c.Stdout != nil {
+		return nil, errors.New("adbexec: Stdout already set")
+	}
+	var stdout bytes.Buffer
+	c.Stdout = &stdout
+
+	captureErr := c.Stderr == nil
+	if captureErr {
+		c.Stderr = &prefixSuffixSaver{N: 32 << 10}
+	}
+
+	err := c.Run()
+	if err != nil && captureErr {
+		if ee, ok := err.(*ExitError); ok {
+			ee.Stderr = c.Stderr.(*prefixSuffixSaver).Bytes()
+		}
+	}
+	return stdout.Bytes(), err
+}
+
+// CombinedOutput runs the command and returns its combined standard output and
+// standard error. Note that due to the way ADB buffers output, unless PTY is
+// true, they may not be interleaved in the exact same way the process wrote
+// them.
+func (c *Cmd) CombinedOutput() ([]byte, error) {
+	if c.Stdout != nil {
+		return nil, errors.New("adbexec: Stdout already set")
+	}
+	if c.Stderr != nil {
+		return nil, errors.New("adbexec: Stderr already set")
+	}
+	var b bytes.Buffer
+	c.Stdout = &b
+	c.Stderr = &b
+	err := c.Run()
+	return b.Bytes(), err
+}
+
+// An ExitError reports an unsuccessful exit by a command started by [Cmd].
+type ExitError struct {
+	*ProcessState
+
+	// Stderr holds a subset of the standard error output from the
+	// [Cmd.Output] method if standard error was not otherwise being
+	// collected.
+	//
+	// If the error output is long, Stderr may contain only a prefix
+	// and suffix of the output, with the middle replaced with
+	// text about the number of omitted bytes.
+	//
+	// Stderr is provided for debugging, for inclusion in error messages.
+	// Users with other needs should redirect Cmd.Stderr as needed.
+	Stderr []byte
+}
+
+func (e *ExitError) Error() string {
+	return e.ProcessState.String()
+}
+
+// prefixSuffixSaver is an io.Writer which retains the first N bytes
+// and the last N bytes written to it. The Bytes() methods reconstructs
+// it with a pretty error message.
+//
+// copied from os/exec.prefixSuffixSaver
+//
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+type prefixSuffixSaver struct {
+	N         int // max size of prefix or suffix
+	prefix    []byte
+	suffix    []byte // ring buffer once len(suffix) == N
+	suffixOff int    // offset to write into suffix
+	skipped   int64
+}
+
+func (w *prefixSuffixSaver) Write(p []byte) (n int, err error) {
+	lenp := len(p)
+	p = w.fill(&w.prefix, p)
+
+	// Only keep the last w.N bytes of suffix data.
+	if overage := len(p) - w.N; overage > 0 {
+		p = p[overage:]
+		w.skipped += int64(overage)
+	}
+	p = w.fill(&w.suffix, p)
+
+	// w.suffix is full now if p is non-empty. Overwrite it in a circle.
+	for len(p) > 0 { // 0, 1, or 2 iterations.
+		n := copy(w.suffix[w.suffixOff:], p)
+		p = p[n:]
+		w.skipped += int64(n)
+		w.suffixOff += n
+		if w.suffixOff == w.N {
+			w.suffixOff = 0
+		}
+	}
+	return lenp, nil
+}
+
+// fill appends up to len(p) bytes of p to *dst, such that *dst does not
+// grow larger than w.N. It returns the un-appended suffix of p.
+func (w *prefixSuffixSaver) fill(dst *[]byte, p []byte) (pRemain []byte) {
+	if remain := w.N - len(*dst); remain > 0 {
+		add := min(len(p), remain)
+		*dst = append(*dst, p[:add]...)
+		p = p[add:]
+	}
+	return p
+}
+
+func (w *prefixSuffixSaver) Bytes() []byte {
+	if w.suffix == nil {
+		return w.prefix
+	}
+	if w.skipped == 0 {
+		return append(w.prefix, w.suffix...)
+	}
+	var buf bytes.Buffer
+	buf.Grow(len(w.prefix) + len(w.suffix) + 50)
+	buf.Write(w.prefix)
+	buf.WriteString("\n... omitting ")
+	buf.WriteString(strconv.FormatInt(w.skipped, 10))
+	buf.WriteString(" bytes ...\n")
+	buf.Write(w.suffix[w.suffixOff:])
+	buf.Write(w.suffix[:w.suffixOff])
+	return buf.Bytes()
+}
