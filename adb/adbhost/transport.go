@@ -1,16 +1,21 @@
 package adbhost
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/pgaskin/go-adb/adb"
+	"github.com/pgaskin/go-adb/adb/adbproto"
 )
 
 // Transport selects an ADB server to connect to via a host server.
@@ -87,8 +92,12 @@ func (t DefaultTransport) transport() string {
 type ServerDialer struct {
 	d *Dialer
 	t Transport
-	k atomic.Pointer[sync.Mutex]
+	k atomic.Pointer[sync.Mutex] // protects t if not a TransportID
+	f atomic.Pointer[map[adbproto.Feature]struct{}]
 }
+
+var _ adb.Dialer = (*ServerDialer)(nil)
+var _ adb.Features = (*ServerDialer)(nil)
 
 type serverDialerConn struct {
 	net.Conn
@@ -122,7 +131,8 @@ func StickyServer(d *Dialer, t Transport) *ServerDialer {
 	return s
 }
 
-// DialADB opens a connection to svc on the transport.
+// DialADB opens a connection to svc on the transport. If the dialer was created
+// with [StickyServer], this will pin the [TransportID] if supported.
 func (h *ServerDialer) DialADB(ctx context.Context, svc string) (net.Conn, error) {
 	var sticking bool
 	if m := h.k.Load(); m != nil {
@@ -165,6 +175,7 @@ func (h *ServerDialer) DialADB(ctx context.Context, svc string) (net.Conn, error
 }
 
 // DialADBHostTransport opens a connection to the host svc for the transport.
+// Note that this will not pin the TransportID for a [StickyServer].
 func (h *ServerDialer) DialADBHostTransport(ctx context.Context, svc string) (net.Conn, error) {
 	if m := h.k.Load(); m != nil {
 		// we're sticky, but we don't have a pinned transport id yet
@@ -187,6 +198,53 @@ func (h *ServerDialer) TransportID() (TransportID, bool) {
 		}
 	}
 	return TransportID(0), false
+}
+
+// SupportsFeature returns true if the cached list of supported features
+// contains the specified feature. If [ServerDialer.LoadFeatures] has not been
+// called, this will always return false.
+func (h *ServerDialer) SupportsFeature(f adbproto.Feature) bool {
+	if fm := h.f.Load(); fm != nil {
+		_, ok := (*fm)[f]
+		return ok
+	}
+	return false
+}
+
+// LoadFeatures updates the list of supported optional features.
+func (h *ServerDialer) LoadFeatures(ctx context.Context) error {
+	conn, err := h.DialADBHostTransport(ctx, "features")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	buf, err := adbproto.ReadProtocolBytes(conn, nil)
+	if err != nil {
+		return err
+	}
+
+	fm := map[adbproto.Feature]struct{}{}
+	for feat := range bytes.SplitSeq(buf, []byte{','}) {
+		fm[adbproto.Feature(feat)] = struct{}{}
+	}
+	h.f.Store(&fm)
+
+	return nil
+}
+
+// Features returns all supported features. If [ServerDialer.LoadFeatures] has
+// not been called, this will always return an empty iterator.
+func (h *ServerDialer) Features() iter.Seq[adbproto.Feature] {
+	return func(yield func(adbproto.Feature) bool) {
+		if fm := h.f.Load(); fm != nil {
+			for f := range *fm {
+				if !yield(f) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // ServerConnTransportID gets the TransportID from a conn opened via [Host] if
