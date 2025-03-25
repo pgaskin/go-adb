@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/pgaskin/go-adb/adb/adbproto/adbpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // ConnectionState represents the state of a device connected to an ADB host.
@@ -37,9 +40,13 @@ const (
 // ParseConnectionState attempts to parse the provided string as a connection
 // state. Use [ConnectionState.IsValid] to check if it is a known value.
 func ParseConnectionState(s string) ConnectionState {
-	if strings.HasPrefix(s, string(CsNoPerm)+" (") {
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, string(CsNoPerm)+" (") {
 		// https://cs.android.com/android/platform/superproject/main/+/main:system/core/diagnose_usb/diagnose_usb.cpp;l=83-90;drc=9c843a66d11d85e1f69e944f1b37314d3e47aab1
 		return CsNoPerm // this is a special case since adb can add a reason afterwards
+	}
+	if cs := ConnectionState(lower); cs.IsValid() {
+		return cs
 	}
 	return ConnectionState(s)
 }
@@ -99,6 +106,10 @@ const (
 // ParseConnectionType attempts to parse the provided string as a connection
 // type. Use [ConnectionType.IsValid] to check if it is a known value.
 func ParseConnectionType(s string) ConnectionType {
+	lower := strings.ToLower(s)
+	if ct := ConnectionType(lower); ct.IsValid() {
+		return ct
+	}
 	return ConnectionType(s)
 }
 
@@ -198,4 +209,26 @@ func ParseDevices(buf []byte) ([]*TransportInfo, error) {
 	return devs, nil
 }
 
-// TODO: ParseDevicesProto
+// ParseDevicesProto parses a protobuf-encoded device list.
+func ParseDevicesProto(buf []byte) ([]*TransportInfo, error) {
+	var xs adbpb.Devices
+	if err := proto.Unmarshal(buf, &xs); err != nil {
+		return nil, err
+	}
+	devs := make([]*TransportInfo, len(xs.Device))
+	for i, x := range xs.Device {
+		info := TransportInfo{
+			Serial:          x.Serial,
+			State:           ParseConnectionState(x.State.String()),
+			BusAddress:      x.BusAddress,
+			Product:         x.Product,
+			Model:           x.Model,
+			Device:          x.Device,
+			NegotiatedSpeed: x.NegotiatedSpeed,
+			MaxSpeed:        x.MaxSpeed,
+			Transport:       TransportID(x.TransportId),
+		}
+		devs[i] = &info
+	}
+	return devs, nil
+}

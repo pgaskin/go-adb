@@ -45,9 +45,11 @@ func Devices(ctx context.Context, srv *Dialer, long bool) ([]*TransportInfo, err
 	return ParseDevices(buf)
 }
 
-// TrackDevices tracks the devices connected to the server in real-time. This
-// will use the text format internally, which means that not all fields will be
-// set and attributes will be sanitized.
+// TrackDevices tracks the devices connected to the server in real-time. If long
+// is false or the server does not support
+// [adbproto.FeatureDeviceTrackerProtoFormat], this will use the text format
+// internally, which means that not all fields will be set and attributes will
+// be sanitized.
 //
 //	var err error
 //	for info := range adbhost.TrackDevices(ctx, srv, true)(&err) {
@@ -61,14 +63,15 @@ func Devices(ctx context.Context, srv *Dialer, long bool) ([]*TransportInfo, err
 //	}
 func TrackDevices(ctx context.Context, srv *Dialer, long bool) func(*error) iter.Seq[[]*TransportInfo] {
 	return newErrIter(func(yield func([]*TransportInfo) bool) error {
-		var svc string
+		svc, parse := "", ParseDevices
 		if long {
 			svc = "host:track-devices-l"
 		} else {
 			svc = "host:track-devices"
 		}
 		if long && srv.SupportsFeature(adbproto.FeatureDeviceTrackerProtoFormat) {
-			// TODO
+			svc = "host:track-devices-proto-binary" // note: host:track-device-proto-text is another option
+			parse = ParseDevicesProto
 		}
 
 		conn, err := srv.DialADBHost(ctx, svc)
@@ -81,11 +84,11 @@ func TrackDevices(ctx context.Context, srv *Dialer, long bool) func(*error) iter
 		for {
 			buf, err = adbproto.ReadProtocolBytes(conn, buf[:0])
 			if err != nil {
-				return adbproto.ProtocolErrorf("read next device tracker line: %w", err)
+				return adbproto.ProtocolErrorf("read next device tracker item: %w", err)
 			}
-			devs, err := ParseDevices(buf)
+			devs, err := parse(buf)
 			if err != nil {
-				return adbproto.ProtocolErrorf("parse device tracker line: %w", err)
+				return adbproto.ProtocolErrorf("parse device tracker item: %w", err)
 			}
 			if !yield(devs) {
 				return nil
