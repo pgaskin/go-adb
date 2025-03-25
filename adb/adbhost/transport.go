@@ -20,6 +20,7 @@ import (
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=1293-1352;drc=9f298fb1f3317371b49439efb20a598b3a881bf3.
 type Transport interface {
 	hostPrefix() string
+	transport() string
 }
 
 // TransportID selects a specific transport by its ID.
@@ -33,6 +34,10 @@ func (t TransportID) hostPrefix() string {
 	return "host:transport-id:" + strconv.FormatUint(uint64(t), 10)
 }
 
+func (t TransportID) transport() string {
+	return "host-transport-id:" + strconv.FormatUint(uint64(t), 10)
+}
+
 // Serial uniquely identifies devices connected to the ADB host server.
 type Serial string
 
@@ -44,6 +49,13 @@ func (s Serial) String() string {
 }
 
 func (s Serial) hostPrefix() string {
+	if s == "" {
+		return ""
+	}
+	return "host-serial:" + string(s)
+}
+
+func (s Serial) transport() string {
 	if s == "" {
 		return ""
 	}
@@ -66,6 +78,10 @@ func (t DefaultTransport) String() string {
 
 func (t DefaultTransport) hostPrefix() string {
 	return "host:tport:" + string(t)
+}
+
+func (t DefaultTransport) transport() string {
+	return "host-" + string(t)
 }
 
 // TODO: emulator
@@ -116,16 +132,16 @@ func (h *serverDialer) DialADB(ctx context.Context, svc string) (net.Conn, error
 		defer m.Unlock()
 		sticking = true
 	}
-	hostPrefix := h.t.hostPrefix()
-	if hostPrefix == "" {
+	transportSvc := h.t.transport()
+	if transportSvc == "" {
 		return nil, errors.New("invalid transport")
 	}
-	conn, err := h.d.DialADBHost(ctx, hostPrefix)
+	conn, err := h.d.DialADBHost(ctx, transportSvc)
 	if err != nil {
 		return nil, err
 	}
 	tid, ok := h.t.(TransportID)
-	if isLegacy := !strings.HasPrefix(hostPrefix, "host:tport:"); !ok && !isLegacy {
+	if isLegacy := !strings.HasPrefix(transportSvc, "host:tport:"); !ok && !isLegacy {
 		buf := make([]byte, 8)
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			conn.Close()
