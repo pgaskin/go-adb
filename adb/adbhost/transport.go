@@ -34,11 +34,11 @@ func (t TransportID) String() string {
 }
 
 func (t TransportID) hostPrefix() string {
-	return "host:transport-id:" + strconv.FormatUint(uint64(t), 10)
+	return "host-transport-id:" + strconv.FormatUint(uint64(t), 10)
 }
 
 func (t TransportID) transport() string {
-	return "host-transport-id:" + strconv.FormatUint(uint64(t), 10)
+	return "host:transport-id:" + strconv.FormatUint(uint64(t), 10)
 }
 
 // Serial uniquely identifies devices connected to the ADB host server.
