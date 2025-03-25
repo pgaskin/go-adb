@@ -4,14 +4,11 @@ package adbhost
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
-	"slices"
-	"strconv"
 	"time"
-)
 
-// TODO: do I need to worry about protocol versions?
+	"github.com/pgaskin/go-adb/adb/adbproto"
+)
 
 // DefaultAddr is the default address for the ADB host server.
 var DefaultAddr = "localhost:5037"
@@ -47,16 +44,17 @@ func (c *Dialer) DialADBHost(ctx context.Context, svc string) (net.Conn, error) 
 	}
 	conn, err := dc(ctx, "tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("service %q: %w", svc, err)
 	}
 	if err := adbService(ctx, conn, svc); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("service %q: %w", svc, err)
 	}
 	return conn, nil
 }
 
-// TODO: refactor these helpers into a separate package once I figure out where to put them
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/client/adb_client.cpp;l=137-156;drc=c58caa21f0c7efccf1ecbd5a5fd1570ff0c246a3
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb_io.cpp;l=68-75;drc=90228a63bb6a59e8195165fbb7c332be27459696
 
 // adbService connects to svc, using the deadline from ctx, and returning
 // immediately if ctx is cancelled.
@@ -66,17 +64,12 @@ func adbService(ctx context.Context, conn net.Conn, svc string) error {
 		defer func() { ch <- err }()
 		if deadline, ok := ctx.Deadline(); ok {
 			conn.SetDeadline(deadline)
+			defer conn.SetDeadline(time.Time{})
 		}
-		if err := adbSendMsg(conn, svc); err != nil {
-			return fmt.Errorf("service %q: send message: %w", svc, err)
+		if err := adbproto.SendProtocolString(conn, svc); err != nil {
+			return adbproto.ProtocolErrorf("send service: %w", err)
 		}
-		if status, err := adbRecvStatus(conn); err != nil {
-			return fmt.Errorf("service %q: recv status: %w", svc, err)
-		} else if status != [4]byte{'O', 'K', 'A', 'Y'} {
-			return fmt.Errorf("service %q: adb status %q", svc, status)
-		}
-		conn.SetDeadline(time.Time{})
-		return nil
+		return adbproto.ReadOkayFail(conn)
 	}()
 	select {
 	case err := <-ch:
@@ -87,35 +80,4 @@ func adbService(ctx context.Context, conn net.Conn, svc string) error {
 		return ctx.Err()
 	}
 	return nil
-}
-
-// TODO: refactor these and put them somewhere else (maybe go-adb/adb/protocol.go if I can make it reusable for usb stuff?)
-
-func adbSendMsg(conn net.Conn, msg string) error {
-	_, err := conn.Write(fmt.Appendf(nil, "%04x%s", len(msg), msg))
-	return err
-}
-
-func adbRecvStatus(conn net.Conn) (status [4]byte, err error) {
-	_, err = io.ReadFull(conn, status[:])
-	return
-}
-
-func adbRecvMsg(conn net.Conn, buf []byte) ([]byte, error) {
-	var length [4]byte
-	if _, err := io.ReadFull(conn, length[:]); err != nil {
-		return nil, err
-	}
-	n, err := strconv.ParseUint(string(length[:]), 16, 32)
-	if err != nil {
-		return nil, err
-	}
-	if int(n) > cap(buf) {
-		buf = slices.Grow(buf[:0], int(n))
-	}
-	buf = buf[:n]
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
 }
