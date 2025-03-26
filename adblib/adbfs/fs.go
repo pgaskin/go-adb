@@ -16,7 +16,7 @@ import (
 
 	"github.com/pgaskin/go-adb/adb"
 	"github.com/pgaskin/go-adb/adb/adbproto/syncproto"
-	"github.com/pgaskin/go-adb/adblib/internal/bionic"
+	"github.com/pgaskin/go-adb/internal/bionic"
 )
 
 // TODO: write support

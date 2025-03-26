@@ -1,6 +1,6 @@
 package adbexec
 
-import "github.com/pgaskin/go-adb/adblib/internal/android"
+import "github.com/pgaskin/go-adb/internal/android"
 
 // Quote quotes arguments for the shell.
 func Quote(args ...string) string {
