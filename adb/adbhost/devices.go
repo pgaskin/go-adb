@@ -143,7 +143,7 @@ func (c ConnectionType) IsValid() bool {
 type TransportInfo struct {
 	Serial          string
 	State           ConnectionState
-	BusAddress      string
+	BusAddress      string // if using adb's built-in usb rather than libusb, this may have a "usb:" prefix
 	Product         string
 	Model           string
 	Device          string
