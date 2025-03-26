@@ -80,11 +80,14 @@ func (t DefaultTransport) String() string {
 }
 
 func (t DefaultTransport) hostPrefix() string {
-	return "host:tport:" + string(t)
+	if t == "any" {
+		return "host"
+	}
+	return "host-" + string(t)
 }
 
 func (t DefaultTransport) transport() string {
-	return "host-" + string(t)
+	return "host:tport:" + string(t)
 }
 
 // TODO: emulator
