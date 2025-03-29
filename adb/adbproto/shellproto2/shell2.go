@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync/atomic"
+	"sync"
 )
 
 // PacketID is a shell v2 packet ID.
@@ -58,7 +58,7 @@ type Conn struct {
 	rcnt int
 	rbuf [BufferSize]byte
 	wbuf [BufferSize]byte
-	errd atomic.Bool
+	errm sync.Mutex
 	err  error
 }
 
@@ -121,18 +121,16 @@ func (c *Conn) Write(id PacketID, data []byte) bool {
 
 // Error gets the error, if any. It can safely be called concurrently.
 func (c *Conn) Error() error {
-	if c.errd.Load() {
-		return c.err
-	}
-	return nil
+	c.errm.Lock()
+	defer c.errm.Unlock()
+	return c.err
 }
 
 // setError sets the sticky error, if not already set.
 func (c *Conn) setError(err error) {
-	// unlike in c++, this is okay since the go memory model has CAS as
-	// read-like and write-like, so at the end of this function, Load will
-	// always be true and err will be non-nil.
-	if c.errd.CompareAndSwap(false, true) {
+	c.errm.Lock()
+	defer c.errm.Unlock()
+	if c.err == nil {
 		c.err = fmt.Errorf("write: %w", err)
 	}
 }
