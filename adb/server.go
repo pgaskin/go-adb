@@ -48,3 +48,36 @@ func (e *featureNotSupportedError) Error() string {
 func (e *featureNotSupportedError) Is(target error) bool {
 	return target == ErrFeatureNotSupported || target == errors.ErrUnsupported
 }
+
+type modifyFeatureDialer struct {
+	d Dialer
+	f adbproto.Feature
+	p bool
+}
+
+func (m modifyFeatureDialer) DialADB(ctx context.Context, svc string) (net.Conn, error) {
+	return m.d.DialADB(ctx, svc)
+}
+
+func (m modifyFeatureDialer) SupportsFeature(f adbproto.Feature) bool {
+	if m.f == f {
+		return m.p
+	}
+	if df, ok := m.d.(Features); ok && df != nil {
+		return df.SupportsFeature(f)
+	}
+	return false
+}
+
+// WithFeature wraps d, causing [SupportsFeature] to return true for the
+// specified feature. This is intended for testing.
+func WithFeature(d Dialer, f adbproto.Feature) Dialer {
+	return modifyFeatureDialer{d, f, true}
+}
+
+// WithoutFeature wraps d, causing [SupportsFeature] to return false for the
+// specified feature. This is intended for testing or overriding the behaviour
+// of high-level wrappers.
+func WithoutFeature(d Dialer, f adbproto.Feature) Dialer {
+	return modifyFeatureDialer{d, f, false}
+}
