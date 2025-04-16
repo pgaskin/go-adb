@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/pgaskin/go-adb/adb"
 	"github.com/pgaskin/go-adb/adb/adbproto/shellproto2"
 )
 
@@ -16,8 +17,7 @@ import (
 //
 // It is designed to be similar to [os.Process].
 type Process struct {
-	netconn net.Conn
-	conn    *shellproto2.Conn
+	conn *adb.ShellConn2
 
 	mu          sync.Mutex // for writing to the conn
 	stdinClosed bool
@@ -47,11 +47,10 @@ type ProcessState struct {
 //
 // Note that slow stdout/stderr writes will block the connection, including
 // waiting for the process to exit!
-func NewProcess(conn net.Conn, stdin io.Reader, stdout, stderr io.Writer) *Process {
+func NewProcess(conn *adb.ShellConn2, stdin io.Reader, stdout, stderr io.Writer) *Process {
 	proc := &Process{
-		netconn: conn,
-		conn:    shellproto2.New(conn),
-		done:    make(chan struct{}),
+		conn: conn,
+		done: make(chan struct{}),
 	}
 
 	go func() {
@@ -113,7 +112,7 @@ func (p *Process) disconnect(state *ProcessState) {
 			p.state = state
 			close(p.done) // wake up all current and future waiters
 		}()
-		p.netconn.Close() // close the connection if we haven't already
+		p.conn.Close() // close the connection if we haven't already
 	}
 }
 
@@ -214,7 +213,7 @@ func (p *Process) Wait() *ProcessState {
 // ProcessConn gets the underlying ADB [net.Conn] for the process. Do not use
 // this unless you know what you are doing.
 func ProcessConn(p *Process) net.Conn {
-	return p.netconn
+	return p.conn.NetConn
 }
 
 // String returns a string describing the process exit status.

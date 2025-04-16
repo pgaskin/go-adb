@@ -12,7 +12,6 @@ import (
 	"strconv"
 
 	"github.com/pgaskin/go-adb/adb"
-	"github.com/pgaskin/go-adb/adb/adbproto"
 	"github.com/pgaskin/go-adb/adb/adbproto/shellproto2"
 )
 
@@ -148,10 +147,7 @@ func (c *Cmd) Start() error {
 			return fmt.Errorf("setup host tty: %w", err)
 		}
 	}
-	if err := adb.SupportsFeature(c.Server, adbproto.FeatureShell2); err != nil {
-		return err
-	}
-	conn, err := c.Server.DialADB(ctx, svc)
+	conn, err := adb.Shell2(ctx, c.Server, svc)
 	if err != nil {
 		return err
 	}
