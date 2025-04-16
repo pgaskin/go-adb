@@ -1,6 +1,7 @@
 package adb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -67,6 +68,129 @@ func Shell2(ctx context.Context, srv Dialer, svc string) (*ShellConn2, error) {
 	return NewShellConn2(conn), nil
 }
 
+// Remount calls the remount command, returning the output. If the dialer
+// supports [adbproto.FeatureRemountShell], the shell v2 (if
+// [adbproto.FeatureShell2]) or legacy shell protocol is used to call the
+// commmand.
+//
+// Note that on failure, a nil error may be returned with the error message in
+// the output. As such, if you care about proper error checking, you should
+// check for [adbproto.FeatureRemountShell] then call remount yourself using the
+// shell v2 protocol.
+func Remount(ctx context.Context, srv Dialer, args string) ([]byte, error) {
+	return remountOrVerity(ctx, srv, "remount", args)
+}
+
+// EnableVerity calls the enable-verity command, returning the output. If the
+// dialer supports [adbproto.FeatureRemountShell], the shell v2 (if
+// [adbproto.FeatureShell2]) or legacy shell protocol is used to call the
+// commmand. Note that on failure, a nil error may be returned with the error
+// message in the output.
+//
+// Note that on failure, a nil error may be returned with the error message in
+// the output. As such, if you care about proper error checking, you should
+// check for [adbproto.FeatureRemountShell] then call enable-verity yourself
+// using the shell v2 protocol.
+func EnableVerity(ctx context.Context, srv Dialer) ([]byte, error) {
+	return remountOrVerity(ctx, srv, "enable-verity", "")
+}
+
+// DisableVerity calls the disable-verity command, returning the output. If the
+// dialer supports [adbproto.FeatureRemountShell], the shell v2 (if
+// [adbproto.FeatureShell2]) or legacy shell protocol is used to call the
+// commmand.
+//
+// Note that on failure, a nil error may be returned with the error message in
+// the output. As such, if you care about proper error checking, you should
+// check for [adbproto.FeatureRemountShell] then call disable-verity yourself
+// using the shell v2 protocol.
+func DisableVerity(ctx context.Context, srv Dialer) ([]byte, error) {
+	return remountOrVerity(ctx, srv, "disable-verity", "")
+}
+
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/client/commandline.cpp;l=1481-1497;drc=08a96199bf8ce0581c366fc9c725351ee127fd21
+func remountOrVerity(ctx context.Context, srv Dialer, what, args string) ([]byte, error) {
+	if err := SupportsFeature(srv, adbproto.FeatureRemountShell); err == nil {
+		return shellRawOutputNoStdin(ctx, srv, what+" "+args)
+	}
+
+	conn, err := srv.DialADB(ctx, what+":"+args)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	context.AfterFunc(ctx, func() {
+		conn.Close() // this will interrupt the output copy
+	})
+
+	buf, err := io.ReadAll(conn)
+	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err // context cancellation error first
+		}
+		return nil, err
+	}
+	return buf, ctx.Err()
+}
+
+// shellRawOutputNoStdin gets the combined stdin and stdout of executing
+// command, ignoring the exit status. If [adbproto.FeatureShell2] is supported,
+// shell v2 is used instead of exec.
+func shellRawOutputNoStdin(ctx context.Context, srv Dialer, command string) ([]byte, error) {
+	if err := SupportsFeature(srv, adbproto.FeatureShell2); err == nil {
+		var b shellproto2.ServiceBuilder
+		b.Raw()
+		b.Command(command)
+
+		conn, err := Shell2(ctx, srv, b.String())
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+
+		context.AfterFunc(ctx, func() {
+			conn.Close() // this will interrupt the output copy
+		})
+
+		var buf bytes.Buffer
+		for {
+			id, pkt, ok := conn.Read()
+			if !ok {
+				return buf.Bytes(), conn.Error()
+			}
+			switch id {
+			case shellproto2.PacketExit:
+				// ignore the exit status for consistency with exec
+				return buf.Bytes(), nil
+			case shellproto2.PacketStdout:
+				buf.Write(pkt)
+			case shellproto2.PacketStderr:
+				buf.Write(pkt)
+			}
+		}
+	} else {
+		conn, err := Exec(ctx, srv, command)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+
+		context.AfterFunc(ctx, func() {
+			conn.Close() // this will interrupt the output copy
+		})
+
+		buf, outputErr := io.ReadAll(conn)
+		if err := ctx.Err(); err != nil {
+			return buf, err // if the context was cancelled, that error takes precedence
+		}
+		if err := outputErr; err != nil {
+			return buf, fmt.Errorf("read stdout: %w", err)
+		}
+		return buf, nil
+	}
+}
+
 // TODO: jdwp
 // TODO: track-jdwp
 // TODO: track-app
@@ -75,14 +199,11 @@ func Shell2(ctx context.Context, srv Dialer, svc string) (*ShellConn2, error) {
 // TODO: abb
 // TODO: abb_exec
 // TODO: framebuffer
-// TODO: remount
 // TODO: reboot
 // TODO: root
 // TODO: unroot
 // TODO: backup
 // TODO: restore
-// TODO: disable-verity
-// TODO: enable-verity
 // TODO: tcpip
 // TODO: usb
 // TODO: dev
