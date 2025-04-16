@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/pgaskin/go-adb/adb/adbproto"
@@ -191,6 +192,30 @@ func shellRawOutputNoStdin(ctx context.Context, srv Dialer, command string) ([]b
 	}
 }
 
+// RestartUSB restarts the ADB daemon in USB mode. Note that as of Android 15,
+// it will restart the daemon (breaking all connections) even if already in USB mode.
+func RestartUSB(ctx context.Context, srv Dialer) error {
+	conn, err := srv.DialADB(ctx, "usb:")
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(io.Discard, conn) // adb will close the connection when restarting
+	return err
+}
+
+// RestartTCP restarts the ADB daemon in TCP/IP mode listening on the
+// specified port. Note that as of Android 15, it will always restart the daemon
+// (breaking all connections), and USB will still work on the damon listening on
+// TCP/IP.
+func RestartTCP(ctx context.Context, srv Dialer, port uint16) error {
+	conn, err := srv.DialADB(ctx, "tcpip:"+strconv.FormatInt(int64(port), 10))
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(io.Discard, conn) // adb will close the connection when restarting
+	return err
+}
+
 // TODO: jdwp
 // TODO: track-jdwp
 // TODO: track-app
@@ -204,8 +229,6 @@ func shellRawOutputNoStdin(ctx context.Context, srv Dialer, command string) ([]b
 // TODO: unroot
 // TODO: backup
 // TODO: restore
-// TODO: tcpip
-// TODO: usb
 // TODO: dev
 // TODO: dev-raw
 // TODO: sync
