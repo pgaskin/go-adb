@@ -6,11 +6,11 @@ import (
 	"io"
 	"io/fs"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/pgaskin/go-adb/adb"
+	"github.com/pgaskin/go-adb/adb/adbproto"
 	"github.com/pgaskin/go-adb/adb/adbproto/syncproto"
 	"github.com/pgaskin/go-adb/internal/bionic"
 )
@@ -72,12 +72,16 @@ type DirEntry = fs.DirEntry
 // FileMode represents a file's mode and permission bits.
 type FileMode = fs.FileMode
 
+// PathError records an error and the operation and file path that caused it.
+type PathError = fs.PathError
+
 var (
-	ErrInvalid    = fs.ErrInvalid
-	ErrPermission = fs.ErrPermission
-	ErrExist      = fs.ErrExist
-	ErrNotExist   = fs.ErrNotExist
-	ErrClosed     = fs.ErrClosed
+	ErrInvalid     = fs.ErrInvalid
+	ErrPermission  = fs.ErrPermission
+	ErrExist       = fs.ErrExist
+	ErrNotExist    = fs.ErrNotExist
+	ErrClosed      = fs.ErrClosed
+	ErrUnsupported = errors.ErrUnsupported
 )
 
 type fileInfo struct {
@@ -94,6 +98,11 @@ func (s *fileInfo) Mode() FileMode     { return s.mode }
 func (s *fileInfo) ModTime() time.Time { return s.modTime }
 func (s *fileInfo) IsDir() bool        { return s.mode.IsDir() }
 func (s *fileInfo) Sys() any           { return s.sys }
+func (s *fileInfo) String() string     { return fs.FormatFileInfo(s) }
+
+func dirEntry(f *fileInfo) fs.DirEntry {
+	return fs.FileInfoToDirEntry(f)
+}
 
 func fillFileInfoStat1(dst *fileInfo, src *syncproto.SyncStat1) {
 	dst.size = int64(src.Size)
@@ -189,36 +198,76 @@ func syncFileMode(mode fs.FileMode) uint32 {
 	return m
 }
 
-// syncFailError parses well-known errors from sync failures or returns the
-// original error.
-func syncFailError(err syncproto.SyncFail) error {
-	switch _, errno, _ := bionic.FromMsgSuffix(string(err)); errno {
-	case "EINVAL":
-		return ErrInvalid
-	case "EPERM":
-		return ErrPermission
-	case "EEXIST":
-		return ErrExist
-	case "ENOENT":
-		return ErrNotExist
-	}
-	return err
+// wrappedErr wraps an error from syncproto to match the stdlib error types.
+type wrappedErr struct {
+	sysErr error
+	stdErr error
 }
 
-// syncFailError parses well-known errors from errno values or returns a generic
-// error.
-func errnoError(errno uint32) error {
-	switch errno {
-	case 22:
-		return ErrInvalid
-	case 1:
-		return ErrPermission
-	case 17:
-		return ErrExist
-	case 2:
-		return ErrNotExist
+// syncFailError converts err to match stdlib errors if possible.
+func syncFailError(err syncproto.SyncFail) error {
+	var stdErr error
+	switch _, errno, _ := bionic.FromMsgSuffix(string(err)); errno {
+	case "EINVAL":
+		stdErr = ErrInvalid
+	case "EPERM", "EACCES":
+		stdErr = ErrPermission
+	case "EEXIST":
+		stdErr = ErrExist
+	case "ENOENT":
+		stdErr = ErrNotExist
+	case "ENOSYS", "ENOTSUP", "EOPNOTSUPP":
+		stdErr = ErrUnsupported
 	}
-	return errors.New("error " + strconv.FormatUint(uint64(errno), 10))
+	return &wrappedErr{
+		stdErr: stdErr,
+		sysErr: err,
+	}
+}
+
+// errnoError converts errno to match stdlib errors if possible.
+func errnoError(errno adbproto.Errno) error {
+	if errno == 0 {
+		return nil
+	}
+	var stdErr error
+	switch errno {
+	case adbproto.EINVAL:
+		stdErr = ErrInvalid
+	case adbproto.EPERM, adbproto.EACCES:
+		stdErr = ErrPermission
+	case adbproto.EEXIST:
+		stdErr = ErrExist
+	case adbproto.ENOENT:
+		stdErr = ErrNotExist
+	case 38, 95:
+		stdErr = ErrUnsupported
+	}
+	return &wrappedErr{
+		stdErr: stdErr,
+		sysErr: errno,
+	}
+}
+
+func (w *wrappedErr) Error() string {
+	if w.stdErr == nil {
+		return w.sysErr.Error()
+	}
+	return w.stdErr.Error() + ": " + w.sysErr.Error()
+}
+
+func (w *wrappedErr) Unwrap() error {
+	return w.sysErr
+}
+
+func (w *wrappedErr) Is(target error) bool {
+	if w.stdErr == nil {
+		return false
+	}
+	if t, ok := target.(*wrappedErr); ok {
+		return w.stdErr == t.stdErr
+	}
+	return w.stdErr == target
 }
 
 // Stat gets information about the specified file. If the file is a symbolic
