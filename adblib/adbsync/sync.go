@@ -3,9 +3,11 @@ package adbsync
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -43,15 +45,22 @@ type Client struct {
 	// CompressionConfig contains options for compression and decompression.
 	CompressionConfig *CompressionConfig
 
-	negotiateCompressOnce sync.Once
-	compressFlag          uint32
-	decompressFlag        uint32
+	featuresOnce   sync.Once
+	compressFlag   uint32
+	decompressFlag uint32
+	statv2         error
+	lsv2           error
+	srv2           error
 }
 
-// onceNegotiateCompression must be called by negotiateCompressOnce.
-func (c *Client) onceNegotiateCompression() {
+// onceFeatures must be called by featuresOnce. It caches feature support to
+// reduce allocations.
+func (c *Client) onceFeatures() {
 	c.compressFlag = c.CompressionConfig.compressNegotiate(c.Server)
 	c.decompressFlag = c.CompressionConfig.decompressNegotiate(c.Server)
+	c.statv2 = adb.SupportsFeature(c.Server, syncproto.Feature_stat_v2)
+	c.lsv2 = adb.SupportsFeature(c.Server, syncproto.Feature_ls_v2)
+	c.srv2 = adb.SupportsFeature(c.Server, syncproto.Feature_sendrecv_v2)
 }
 
 // CloseIdleConnections closes any connections which were previously connected
@@ -100,40 +109,44 @@ func (s *fileInfo) IsDir() bool        { return s.mode.IsDir() }
 func (s *fileInfo) Sys() any           { return s.sys }
 func (s *fileInfo) String() string     { return fs.FormatFileInfo(s) }
 
-func dirEntry(f *fileInfo) fs.DirEntry {
+func dirEntry(f *fileInfo) DirEntry {
 	return fs.FileInfoToDirEntry(f)
 }
 
-func fillFileInfoStat1(dst *fileInfo, src *syncproto.SyncStat1) {
+func fillFileInfoStat1(dst *fileInfo, src *syncproto.SyncStat1, name string) {
+	dst.name = filepath.Base(name)
 	dst.size = int64(src.Size)
 	dst.mode = fsFileMode(src.Mode)
 	dst.modTime = time.Unix(int64(src.Mtime), 0)
 	dst.sys = src
 }
 
-func fillFileInfoStat2(dst *fileInfo, src *syncproto.SyncStat2) {
+func fillFileInfoStat2(dst *fileInfo, src *syncproto.SyncStat2, name string) {
+	dst.name = filepath.Base(name)
 	dst.size = int64(src.Size)
 	dst.mode = fsFileMode(src.Mode)
 	dst.modTime = time.Unix(src.Mtime, 0)
 	dst.sys = src
 }
 
-func fillFileInfoDent1(dst *fileInfo, src *syncproto.SyncDent1) {
+func fillFileInfoDent1(dst *fileInfo, src *syncproto.SyncDent1, name string) {
+	dst.name = filepath.Base(name)
 	dst.size = int64(src.Size)
 	dst.mode = fsFileMode(src.Mode)
 	dst.modTime = time.Unix(int64(src.Mtime), 0)
 	dst.sys = src
 }
 
-func fillFileInfoDent2(dst *fileInfo, src *syncproto.SyncDent2) {
+func fillFileInfoDent2(dst *fileInfo, src *syncproto.SyncDent2, name string) {
+	dst.name = filepath.Base(name)
 	dst.size = int64(src.Size)
 	dst.mode = fsFileMode(src.Mode)
 	dst.modTime = time.Unix(src.Mtime, 0)
 	dst.sys = src
 }
 
-// fsFileMode converts an sync file mode into an [io/fs.FileMode].
-func fsFileMode(mode uint32) fs.FileMode {
+// fsFileMode converts an sync file mode into an [FileMode].
+func fsFileMode(mode uint32) FileMode {
 	m := fs.FileMode(mode & 0777)
 	switch mode & bionic.S_IFMT {
 	case bionic.S_IFREG:
@@ -166,7 +179,7 @@ func fsFileMode(mode uint32) fs.FileMode {
 }
 
 // syncFileMode converts an [io/fs.FileMode] into a sync file mode.
-func syncFileMode(mode fs.FileMode) uint32 {
+func syncFileMode(mode FileMode) uint32 {
 	m := uint32(mode & fs.ModePerm)
 	switch mode & fs.ModeType {
 	case fs.ModeDevice:
@@ -301,7 +314,7 @@ func (c *Client) ReadFile(name string) ([]byte, error) {
 }
 
 // WriteFile writes data to the specified file, creating it if necessary.
-func (c *Client) WriteFile(name string, data []byte, mode fs.FileMode) error {
+func (c *Client) WriteFile(name string, data []byte, mode FileMode) error {
 	return errors.ErrUnsupported // TODO
 }
 
@@ -312,7 +325,7 @@ func (c *Client) OpenFileReader(name string) (io.ReadCloser, error) {
 
 // OpenFileReader opens a writer to the specified file. The error for the
 // [io.Closer] must be checked to ensure the file was read successfully.
-func (c *Client) OpenFileWriter(name string, mode fs.FileMode) (io.WriteCloser, error) {
+func (c *Client) OpenFileWriter(name string, mode FileMode) (io.WriteCloser, error) {
 	return nil, errors.ErrUnsupported // TODO
 }
 
@@ -323,7 +336,8 @@ func (c *Client) OpenFileWriter(name string, mode fs.FileMode) (io.WriteCloser, 
 // It can usually be reused after requests, but certain kinds of errors will
 // terminate the connection.
 type syncConn struct {
-	conn net.Conn
+	conn   net.Conn
+	closed error
 
 	compressionConfig *CompressionConfig
 	compressFlag      uint32
@@ -332,19 +346,71 @@ type syncConn struct {
 
 // TODO
 
-func (c *syncConn) lstat1() (*syncproto.SyncStat1, error) {
-	return nil, errors.ErrUnsupported // TODO
-}
-
-func (c *syncConn) lstat2() (*syncproto.SyncStat2, error) {
-	return nil, errors.ErrUnsupported // TODO
-}
-
-func (c *syncConn) stat2() (*syncproto.SyncStat2, error) {
-	return nil, errors.ErrUnsupported // TODO
-}
-
 // Close closes the connection.
 func (c *syncConn) Close() error {
+	if c.closed != nil {
+		return c.closed
+	}
+	c.closed = net.ErrClosed
 	return c.conn.Close()
+}
+
+// Usable returns true if the connection can be reused.
+func (c *syncConn) Usable() bool {
+	return c.closed == nil
+}
+
+// abort closes a connection as unusable due to reason.
+func (c *syncConn) abort(err error, reason string) {
+	if c.closed != nil {
+		return
+	}
+	if errors.Is(err, net.ErrClosed) || reason == "" {
+		c.closed = net.ErrClosed
+	} else {
+		c.closed = fmt.Errorf("%w (%s)", net.ErrClosed, reason)
+	}
+	c.conn.Close()
+}
+
+func (c *syncConn) Lstat1(name string) (FileInfo, error) {
+	if c.closed != nil {
+		return nil, c.closed
+	}
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_LSTAT_V1, "/"+name); err != nil {
+		c.abort(err, "lstat_v1 request error")
+		return nil, &PathError{
+			Op:   "lstat_v1",
+			Path: name,
+			Err:  err,
+		}
+	}
+	st, err := syncproto.SyncResponseObject[syncproto.SyncStat1](c.conn, syncproto.Packet_LSTAT_V1)
+	if err != nil {
+		c.abort(err, "lstat_v1 response error")
+		return nil, &PathError{
+			Op:   "lstat_v1",
+			Path: name,
+			Err:  err,
+		}
+	}
+	if *st == (syncproto.SyncStat1{}) {
+		// connection is still usable; we have a response
+		return nil, &PathError{
+			Op:   "lstat_v1",
+			Path: name,
+			Err:  fmt.Errorf("%w (or permission denied)", ErrNotExist), // we have no way to tell from here with v1
+		}
+	}
+	var fsStat fileInfo
+	fillFileInfoStat1(&fsStat, st, name)
+	return &fsStat, nil
+}
+
+func (c *syncConn) Lstat2(name string) (FileInfo, error) {
+	return nil, errors.ErrUnsupported // TODO
+}
+
+func (c *syncConn) Stat2(name string) (FileInfo, error) {
+	return nil, errors.ErrUnsupported // TODO
 }
