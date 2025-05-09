@@ -1,6 +1,7 @@
 package syncproto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net"
@@ -149,6 +150,17 @@ func SyncRequest(conn net.Conn, id PacketID, path string) error {
 	return nil
 }
 
+func SyncRequestObject(conn net.Conn, id PacketID, obj any) error {
+	req, err := binary.Append(id[:], binary.LittleEndian, obj)
+	if err != nil {
+		return adbproto.ProtocolErrorf("encode sync request: %w", err)
+	}
+	if _, err := conn.Write(req); err != nil {
+		return adbproto.ProtocolErrorf("sync request: %w", err)
+	}
+	return nil
+}
+
 func SyncResponse(conn net.Conn) error {
 	b := make([]byte, 4)
 	if _, err := io.ReadFull(conn, b); err != nil {
@@ -206,4 +218,52 @@ func SyncResponseCheck(conn net.Conn, id PacketID) error {
 		}
 	}
 	return nil
+}
+
+// SyncDataReader returns a reader which reads recv data from conn. It returns
+// [io.EOF] after successfully reading everything, or a sticky error otherwise.
+// The reader is not safe for concurrent usage.
+func SyncDataReader(conn net.Conn) io.Reader {
+	return &syncDataReader{
+		conn: conn,
+	}
+}
+
+type syncDataReader struct {
+	conn net.Conn
+	buf  bytes.Buffer
+	err  error
+}
+
+func (r *syncDataReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	if r.buf.Len() == 0 {
+		// get another chunk
+		st, err := SyncResponseObject[SyncData](r.conn, Packet_DATA)
+		if err != nil {
+			r.err = err
+			return 0, r.err
+		}
+
+		// check if we don't have any chunks left
+		if st == nil {
+			r.err = io.EOF
+			return 0, r.err
+		}
+
+		// read a chunk
+		r.buf.Grow(int(st.Size))
+		if _, err := io.ReadFull(r.conn, r.buf.AvailableBuffer()[:st.Size]); err != nil {
+			r.err = err
+			return 0, r.err
+		} else {
+			r.buf.Write(r.buf.AvailableBuffer()[:st.Size])
+		}
+	}
+
+	// read from our buffered chunk
+	return r.buf.Read(p)
 }
