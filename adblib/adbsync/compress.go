@@ -16,6 +16,7 @@ import (
 type CompressionMethod string
 
 const (
+	compressionMethodNone   CompressionMethod = "" // not exported intentionally
 	CompressionMethodBrotli CompressionMethod = "brotli"
 	CompressionMethodLZ4    CompressionMethod = "lz4"
 	CompressionMethodZstd   CompressionMethod = "zstd"
@@ -105,7 +106,7 @@ func defaultDecompress(method CompressionMethod, r io.Reader) (io.ReadCloser, er
 	}
 }
 
-func (c *CompressionConfig) compressNegotiate(d adb.Dialer) (flag uint32) {
+func (c *CompressionConfig) compressNegotiate(d adb.Dialer) CompressionMethod {
 	if c == nil {
 		c = DefaultCompressionConfig
 	}
@@ -114,14 +115,14 @@ func (c *CompressionConfig) compressNegotiate(d adb.Dialer) (flag uint32) {
 		m = defaultMethods
 	}
 	for _, m := range m {
-		if adb.SupportsFeature(d, m.adbFeature()) == nil {
-			return m.syncFlag()
+		if m == compressionMethodNone || adb.SupportsFeature(d, m.adbFeature()) == nil {
+			return m
 		}
 	}
-	return syncproto.SyncFlag_None
+	return compressionMethodNone
 }
 
-func (c *CompressionConfig) decompressNegotiate(d adb.Dialer) (flag uint32) {
+func (c *CompressionConfig) decompressNegotiate(d adb.Dialer) CompressionMethod {
 	if c == nil {
 		c = DefaultCompressionConfig
 	}
@@ -130,14 +131,17 @@ func (c *CompressionConfig) decompressNegotiate(d adb.Dialer) (flag uint32) {
 		m = defaultMethods
 	}
 	for _, m := range m {
-		if adb.SupportsFeature(d, m.adbFeature()) == nil {
-			return m.syncFlag()
+		if m == compressionMethodNone || adb.SupportsFeature(d, m.adbFeature()) == nil {
+			return m
 		}
 	}
-	return syncproto.SyncFlag_None
+	return compressionMethodNone
 }
 
 func (c *CompressionConfig) compress(method CompressionMethod, w io.Writer) (io.WriteCloser, error) {
+	if method == compressionMethodNone {
+		panic("compress called with method none")
+	}
 	if c == nil {
 		c = DefaultCompressionConfig
 	}
@@ -149,6 +153,9 @@ func (c *CompressionConfig) compress(method CompressionMethod, w io.Writer) (io.
 }
 
 func (c *CompressionConfig) decompress(method CompressionMethod, r io.Reader) (io.ReadCloser, error) {
+	if method == compressionMethodNone {
+		panic("decompress called with method none")
+	}
 	if c == nil {
 		c = DefaultCompressionConfig
 	}

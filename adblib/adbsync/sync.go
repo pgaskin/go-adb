@@ -48,19 +48,19 @@ type Client struct {
 	// CompressionConfig contains options for compression and decompression.
 	CompressionConfig *CompressionConfig
 
-	featuresOnce   sync.Once
-	compressFlag   uint32
-	decompressFlag uint32
-	statv2         error
-	lsv2           error
-	srv2           error
+	featuresOnce sync.Once
+	compress     CompressionMethod
+	decompress   CompressionMethod
+	statv2       error
+	lsv2         error
+	srv2         error
 }
 
 // onceFeatures must be called by featuresOnce. It caches feature support to
 // reduce allocations.
 func (c *Client) onceFeatures() {
-	c.compressFlag = c.CompressionConfig.compressNegotiate(c.Server)
-	c.decompressFlag = c.CompressionConfig.decompressNegotiate(c.Server)
+	c.compress = c.CompressionConfig.compressNegotiate(c.Server)
+	c.decompress = c.CompressionConfig.decompressNegotiate(c.Server)
 	c.statv2 = adb.SupportsFeature(c.Server, syncproto.Feature_stat_v2)
 	c.lsv2 = adb.SupportsFeature(c.Server, syncproto.Feature_ls_v2)
 	c.srv2 = adb.SupportsFeature(c.Server, syncproto.Feature_sendrecv_v2)
@@ -71,22 +71,31 @@ func (c *Client) onceFeatures() {
 func (c *Client) getConn() (*syncConn, error) {
 	c.featuresOnce.Do(c.onceFeatures)
 	// TODO: connection pool
-	conn, err := c.Server.DialADB(context.TODO(), "sync:")
+	ctx := context.Background()
+	if c.ConnectTimeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(c.ConnectTimeout))
+		defer cancel()
+	}
+	conn, err := c.Server.DialADB(ctx, "sync:")
 	if err != nil {
 		return nil, err
 	}
 	return &syncConn{
+		client:            c,
 		conn:              conn,
 		compressionConfig: c.CompressionConfig,
-		compressFlag:      c.compressFlag,
-		decompressFlag:    c.decompressFlag,
+		compress:          c.compress,
+		decompress:        c.decompress,
 	}, nil
 }
 
 func (c *Client) putConn(conn *syncConn) {
-	if conn.Usable() {
-		// TODO: connection pool
+	if !conn.Usable() {
+		conn.Close()
+		return
 	}
+	conn.Close() // TODO: connection pool
 }
 
 // CloseIdleConnections closes any connections which were previously connected
@@ -246,7 +255,16 @@ type wrappedErr struct {
 	stdErr error
 }
 
-// syncFailError converts err to match stdlib errors if possible.
+// maybeSyncFailError uses syncFailError if err is a non-wrapped SyncFail.
+func maybeSyncFailError(err error) error {
+	if err, ok := err.(syncproto.SyncFail); ok {
+		return syncFailError(err)
+	}
+	return err
+}
+
+// syncFailError converts err to match stdlib errors if possible. This should be
+// used where adb may use SendSyncFailErrno in file_sync_service.cpp.
 func syncFailError(err syncproto.SyncFail) error {
 	var stdErr error
 	switch _, errno, _ := bionic.FromMsgSuffix(string(err)); errno {
@@ -323,7 +341,7 @@ func (c *Client) Stat(name string) (FileInfo, error) {
 	}
 	defer c.putConn(conn)
 
-	if c.statv2 != nil {
+	if err := c.statv2; err != nil {
 		return nil, &PathError{
 			Op:   "stat",
 			Path: name,
@@ -392,13 +410,27 @@ func (c *Client) ReadDir(name string) ([]DirEntry, error) {
 
 // Open opens a reader for the specified file.
 func (c *Client) Open(name string) (io.ReadCloser, error) {
-	return nil, errors.ErrUnsupported // TODO
+	conn, err := c.getConn()
+	if err != nil {
+		return nil, err
+	}
+	if c.srv2 == nil {
+		return conn.Recv2(name)
+	}
+	return conn.Recv1(name)
 }
 
 // Create opens a writer to the specified file. The error for the [io.Closer]
 // must be checked to ensure the file was read successfully.
 func (c *Client) Create(name string, mode FileMode) (io.WriteCloser, error) {
-	return nil, errors.ErrUnsupported // TODO
+	conn, err := c.getConn()
+	if err != nil {
+		return nil, err
+	}
+	if c.srv2 == nil {
+		return conn.Send1(name, mode)
+	}
+	return conn.Send2(name, mode)
 }
 
 // ReadFile reads the specified file and returns the contents.
@@ -409,7 +441,7 @@ func (c *Client) ReadFile(name string) ([]byte, error) {
 	}
 	defer f.Close()
 
-	buf, err := io.ReadAll(f) // TODO: optimize for certain cases
+	buf, err := io.ReadAll(f) // TODO: optimize for certain cases (e.g., read without compression directly into a bytes.Buffer)
 	if err != nil {
 		return nil, err
 	}
@@ -424,10 +456,20 @@ func (c *Client) WriteFile(name string, data []byte, mode FileMode) error {
 	}
 	defer f.Close()
 
+	// TODO: optimize for certain cases (e.g., write small single-data-message files all at once without compression)
+
 	if _, err = f.Write(data); err != nil {
 		return err
 	}
 	return f.Close()
+}
+
+// Symlink creates newname as a symbolic link to oldname.
+func (c *Client) Symlink(oldname, newname string) error {
+	if len(oldname) > syncproto.SyncDataMax {
+		return fmt.Errorf("%w: name too long", ErrInvalid)
+	}
+	return c.WriteFile(newname, []byte(oldname), fs.ModeSymlink)
 }
 
 // syncConn wraps a single connection to the sync service.
@@ -435,12 +477,13 @@ func (c *Client) WriteFile(name string, data []byte, mode FileMode) error {
 // It can usually be reused after requests, but certain kinds of errors will
 // terminate the connection.
 type syncConn struct {
+	client *Client
 	conn   net.Conn
 	closed error
 
 	compressionConfig *CompressionConfig
-	compressFlag      uint32
-	decompressFlag    uint32
+	compress          CompressionMethod
+	decompress        CompressionMethod
 }
 
 // TODO
@@ -490,7 +533,7 @@ func (c *syncConn) Lstat1(name string) (FileInfo, error) {
 		return nil, &PathError{
 			Op:   "lstat_v1",
 			Path: name,
-			Err:  err,
+			Err:  maybeSyncFailError(err),
 		}
 	}
 	if *st == (syncproto.SyncStat1{}) {
@@ -524,7 +567,7 @@ func (c *syncConn) Lstat2(name string) (FileInfo, error) {
 		return nil, &PathError{
 			Op:   "lstat_v2",
 			Path: name,
-			Err:  err,
+			Err:  maybeSyncFailError(err),
 		}
 	}
 	if st.Error != 0 {
@@ -557,7 +600,7 @@ func (c *syncConn) Stat2(name string) (FileInfo, error) {
 		return nil, &PathError{
 			Op:   "stat_v2",
 			Path: name,
-			Err:  err,
+			Err:  maybeSyncFailError(err),
 		}
 	}
 	if st.Error != 0 {
@@ -592,7 +635,7 @@ func (c *syncConn) List1(name string) ([]DirEntry, error) {
 			return nil, &PathError{
 				Op:   "list_v1_dent",
 				Path: name,
-				Err:  err,
+				Err:  maybeSyncFailError(err),
 			}
 		}
 		if st == nil {
@@ -644,7 +687,7 @@ func (c *syncConn) List2(name string) ([]DirEntry, error) {
 			return nil, &PathError{
 				Op:   "list_v2_dent",
 				Path: name,
-				Err:  err,
+				Err:  maybeSyncFailError(err),
 			}
 		}
 		if st == nil {
@@ -692,14 +735,137 @@ func (c *syncConn) List2(name string) ([]DirEntry, error) {
 	return de, nil
 }
 
-func (c *syncConn) Send1() error {
-	return errors.ErrUnsupported
+func (c *syncConn) Send1(name string, mode FileMode) (io.WriteCloser, error) {
+	return nil, errors.ErrUnsupported // TODO
 }
 
-func (c *syncConn) Send2() error {
-	return errors.ErrUnsupported
+func (c *syncConn) Send2(name string, mode FileMode) (io.WriteCloser, error) {
+	return nil, errors.ErrUnsupported // TODO
 }
 
-func (c *syncConn) Recv1(name string) error {
-	return errors.ErrUnsupported
+func (c *syncConn) Recv1(name string) (io.ReadCloser, error) {
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_RECV_V1, name); err != nil {
+		c.abort(err, "recv_v1 request protocol error")
+		return nil, &PathError{
+			Op:   "recv_v1",
+			Path: name,
+			Err:  err,
+		}
+	}
+	return &syncConnFileReader{
+		name: name,
+		op:   "recv_v1",
+		conn: c,
+		r:    io.NopCloser(syncproto.SyncDataReader(c.conn)),
+	}, nil
+}
+
+func (c *syncConn) Recv2(name string) (io.ReadCloser, error) {
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_RECV_V2, name); err != nil {
+		c.abort(err, "recv_v2 request protocol error")
+		return nil, &PathError{
+			Op:   "recv_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	if err := syncproto.SyncRequestObject(c.conn, syncproto.Packet_RECV_V2, syncproto.SyncRecv2{
+		Flags: c.decompress.syncFlag(),
+	}); err != nil {
+		c.abort(err, "recv_v2 request protocol error")
+		return nil, &PathError{
+			Op:   "recv_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	if c.decompress == compressionMethodNone {
+		return &syncConnFileReader{
+			name: name,
+			op:   "recv_v2",
+			conn: c,
+			r:    io.NopCloser(syncproto.SyncDataReader(c.conn)),
+		}, nil
+	}
+	dec, err := c.compressionConfig.decompress(c.decompress, syncproto.SyncDataReader(c.conn))
+	if err != nil {
+		c.abort(err, "recv_v2 decompression error")
+		return nil, &PathError{
+			Op:   "recv_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	return &syncConnFileReader{
+		name: name,
+		op:   "recv_v2_" + string(c.decompress),
+		conn: c,
+		r:    dec,
+	}, nil
+}
+
+type syncConnFileReader struct {
+	name string
+	op   string
+	mu   sync.Mutex
+	conn *syncConn
+	r    io.ReadCloser // the closer part is for decompressors which do verification/etc on close
+	err  error
+}
+
+func (r *syncConnFileReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.conn == nil {
+		return 0, net.ErrClosed
+	}
+
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	n, err := r.r.Read(p)
+	if err != nil {
+		// return the conn to the pool
+		if err != io.EOF {
+			r.conn.abort(err, "recv data protocol error")
+			r.conn.client.putConn(r.conn)
+			r.conn = nil
+		} else {
+			r.conn.client.putConn(r.conn)
+			r.conn = nil
+		}
+		// check for decompressor errors if EOF
+		if err == io.EOF {
+			err = r.r.Close()
+			if err == nil {
+				err = io.EOF
+			}
+			r.r = nil
+		}
+		// wrap the error if not EOF
+		if err != io.EOF {
+			err = &PathError{
+				Op:   r.op,
+				Path: r.name,
+				Err:  maybeSyncFailError(err),
+			}
+		}
+		// set the sticky error
+		r.err = err
+	}
+	return n, err
+}
+
+func (r *syncConnFileReader) Close() error {
+	if r.r != nil {
+		_ = r.r.Close() // ignore errors from a decompressor
+	}
+	if r.conn != nil {
+		r.conn.abort(net.ErrClosed, "")
+		r.conn.client.putConn(r.conn)
+		r.conn = nil
+	}
+	return nil
 }
