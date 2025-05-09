@@ -2,12 +2,15 @@
 package adbsync
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +66,29 @@ func (c *Client) onceFeatures() {
 	c.srv2 = adb.SupportsFeature(c.Server, syncproto.Feature_sendrecv_v2)
 }
 
+// TODO: context for requests, cancellation/timeouts
+
+func (c *Client) getConn() (*syncConn, error) {
+	c.featuresOnce.Do(c.onceFeatures)
+	// TODO: connection pool
+	conn, err := c.Server.DialADB(context.TODO(), "sync:")
+	if err != nil {
+		return nil, err
+	}
+	return &syncConn{
+		conn:              conn,
+		compressionConfig: c.CompressionConfig,
+		compressFlag:      c.compressFlag,
+		decompressFlag:    c.decompressFlag,
+	}, nil
+}
+
+func (c *Client) putConn(conn *syncConn) {
+	if conn.Usable() {
+		// TODO: connection pool
+	}
+}
+
 // CloseIdleConnections closes any connections which were previously connected
 // from previous requests but are now idle and prevents future connections from
 // being left idle. It does not interrupt any connections currently in use.
@@ -91,6 +117,9 @@ var (
 	ErrNotExist    = fs.ErrNotExist
 	ErrClosed      = fs.ErrClosed
 	ErrUnsupported = errors.ErrUnsupported
+
+	errNotDirectory = errors.New("not a directory")
+	errIsDirectory  = errors.New("is a directory")
 )
 
 type fileInfo struct {
@@ -288,7 +317,20 @@ func (w *wrappedErr) Is(target error) bool {
 //
 // This requires [syncproto.Feature_stat_v2].
 func (c *Client) Stat(name string) (FileInfo, error) {
-	return nil, errors.ErrUnsupported // TODO
+	conn, err := c.getConn()
+	if err != nil {
+		return nil, err
+	}
+	defer c.putConn(conn)
+
+	if c.statv2 != nil {
+		return nil, &PathError{
+			Op:   "stat",
+			Path: name,
+			Err:  err,
+		}
+	}
+	return conn.Stat2(name)
 }
 
 // Lstat gets information about the specified file. If the file is a symbolic
@@ -297,39 +339,96 @@ func (c *Client) Stat(name string) (FileInfo, error) {
 // If [syncproto.Feature_stat_v2] is not supported, only mode, size, and mtime
 // will be returned.
 func (c *Client) Lstat(name string) (FileInfo, error) {
-	return nil, errors.ErrUnsupported // TODO
-}
+	conn, err := c.getConn()
+	if err != nil {
+		return nil, err
+	}
+	defer c.putConn(conn)
 
-// TODO: OpenDir
+	if c.statv2 == nil {
+		return conn.Lstat2(name)
+	}
+	return conn.Lstat1(name)
+}
 
 // ReadDir lists the specified directory, returning all its directory entries
 // sorted by filename.
 func (c *Client) ReadDir(name string) ([]DirEntry, error) {
+	conn, err := c.getConn()
+	if err != nil {
+		return nil, err
+	}
+	defer c.putConn(conn)
+
+	var de []DirEntry
+	if c.lsv2 == nil {
+		de, err = conn.List2(name)
+	} else {
+		de, err = conn.List1(name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(de) == 0 {
+		// DONE before any entries were seen could be an error or not found, so
+		// try to stat the dir
+		st, err := c.Lstat(name)
+		if err != nil {
+			return nil, err
+		}
+		if !st.IsDir() {
+			return nil, &PathError{
+				Op:   "list",
+				Path: name,
+				Err:  errNotDirectory,
+			}
+		}
+	}
+	slices.SortFunc(de, func(a, b DirEntry) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+	return de, nil
+}
+
+// Open opens a reader for the specified file.
+func (c *Client) Open(name string) (io.ReadCloser, error) {
+	return nil, errors.ErrUnsupported // TODO
+}
+
+// Create opens a writer to the specified file. The error for the [io.Closer]
+// must be checked to ensure the file was read successfully.
+func (c *Client) Create(name string, mode FileMode) (io.WriteCloser, error) {
 	return nil, errors.ErrUnsupported // TODO
 }
 
 // ReadFile reads the specified file and returns the contents.
 func (c *Client) ReadFile(name string) ([]byte, error) {
-	return nil, errors.ErrUnsupported // TODO
+	f, err := c.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	buf, err := io.ReadAll(f) // TODO: optimize for certain cases
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // WriteFile writes data to the specified file, creating it if necessary.
 func (c *Client) WriteFile(name string, data []byte, mode FileMode) error {
-	return errors.ErrUnsupported // TODO
-}
+	f, err := c.Create(name, mode)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
-// OpenFileReader opens a reader for the specified file.
-func (c *Client) OpenFileReader(name string) (io.ReadCloser, error) {
-	return nil, errors.ErrUnsupported // TODO
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	return f.Close()
 }
-
-// OpenFileReader opens a writer to the specified file. The error for the
-// [io.Closer] must be checked to ensure the file was read successfully.
-func (c *Client) OpenFileWriter(name string, mode FileMode) (io.WriteCloser, error) {
-	return nil, errors.ErrUnsupported // TODO
-}
-
-// TODO
 
 // syncConn wraps a single connection to the sync service.
 //
@@ -377,8 +476,8 @@ func (c *syncConn) Lstat1(name string) (FileInfo, error) {
 	if c.closed != nil {
 		return nil, c.closed
 	}
-	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_LSTAT_V1, "/"+name); err != nil {
-		c.abort(err, "lstat_v1 request error")
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_LSTAT_V1, name); err != nil {
+		c.abort(err, "lstat_v1 request protocol error")
 		return nil, &PathError{
 			Op:   "lstat_v1",
 			Path: name,
@@ -387,7 +486,7 @@ func (c *syncConn) Lstat1(name string) (FileInfo, error) {
 	}
 	st, err := syncproto.SyncResponseObject[syncproto.SyncStat1](c.conn, syncproto.Packet_LSTAT_V1)
 	if err != nil {
-		c.abort(err, "lstat_v1 response error")
+		c.abort(err, "lstat_v1 response protocol error")
 		return nil, &PathError{
 			Op:   "lstat_v1",
 			Path: name,
@@ -408,9 +507,199 @@ func (c *syncConn) Lstat1(name string) (FileInfo, error) {
 }
 
 func (c *syncConn) Lstat2(name string) (FileInfo, error) {
-	return nil, errors.ErrUnsupported // TODO
+	if c.closed != nil {
+		return nil, c.closed
+	}
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_LSTAT_V2, name); err != nil {
+		c.abort(err, "lstat_v2 request protocol error")
+		return nil, &PathError{
+			Op:   "lstat_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	st, err := syncproto.SyncResponseObject[syncproto.SyncStat2](c.conn, syncproto.Packet_LSTAT_V2)
+	if err != nil {
+		c.abort(err, "lstat_v2 response protocol error")
+		return nil, &PathError{
+			Op:   "lstat_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	if st.Error != 0 {
+		return nil, &PathError{
+			Op:   "lstat_v2",
+			Path: name,
+			Err:  errnoError(adbproto.Errno(st.Error)),
+		}
+	}
+	var fsStat fileInfo
+	fillFileInfoStat2(&fsStat, st, name)
+	return &fsStat, nil
 }
 
 func (c *syncConn) Stat2(name string) (FileInfo, error) {
-	return nil, errors.ErrUnsupported // TODO
+	if c.closed != nil {
+		return nil, c.closed
+	}
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_STAT_V2, name); err != nil {
+		c.abort(err, "stat_v2 request protocol error")
+		return nil, &PathError{
+			Op:   "stat_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	st, err := syncproto.SyncResponseObject[syncproto.SyncStat2](c.conn, syncproto.Packet_STAT_V2)
+	if err != nil {
+		c.abort(err, "lstat_v2 response protocol error")
+		return nil, &PathError{
+			Op:   "stat_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	if st.Error != 0 {
+		return nil, &PathError{
+			Op:   "stat_v2",
+			Path: name,
+			Err:  errnoError(adbproto.Errno(st.Error)),
+		}
+	}
+	var fsStat fileInfo
+	fillFileInfoStat2(&fsStat, st, name)
+	return &fsStat, nil
+}
+
+func (c *syncConn) List1(name string) ([]DirEntry, error) {
+	if c.closed != nil {
+		return nil, c.closed
+	}
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_LIST_V1, name); err != nil {
+		c.abort(err, "list_v1 request protocol error")
+		return nil, &PathError{
+			Op:   "list_v1",
+			Path: name,
+			Err:  err,
+		}
+	}
+	var de []DirEntry
+	for {
+		st, err := syncproto.SyncResponseObject[syncproto.SyncDent1](c.conn, syncproto.Packet_DENT_V1)
+		if err != nil {
+			c.abort(err, "list_v1 response protocol error")
+			return nil, &PathError{
+				Op:   "list_v1_dent",
+				Path: name,
+				Err:  err,
+			}
+		}
+		if st == nil {
+			break
+		}
+
+		nb := make([]byte, st.Namelen)
+		if _, err := io.ReadFull(c.conn, nb); err != nil {
+			c.abort(err, "list_v1 response protocol error")
+			return nil, &PathError{
+				Op:   "list_v1_dent",
+				Path: name,
+				Err:  adbproto.ProtocolErrorf("read dent_v1 name: %w", err),
+			}
+		}
+		if string(nb) == "." || string(nb) == ".." {
+			continue
+		}
+
+		// note: list v1 ignores dents which fail lstat
+
+		var fsStat fileInfo
+		fillFileInfoDent1(&fsStat, st, string(nb))
+		de = append(de, dirEntry(&fsStat))
+	}
+	if len(de) == 0 {
+		// opendir error or not found
+	}
+	return de, nil
+}
+
+func (c *syncConn) List2(name string) ([]DirEntry, error) {
+	if c.closed != nil {
+		return nil, c.closed
+	}
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_LIST_V2, name); err != nil {
+		c.abort(err, "list_v2 request protocol error")
+		return nil, &PathError{
+			Op:   "list_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	var de []DirEntry
+	for {
+		st, err := syncproto.SyncResponseObject[syncproto.SyncDent2](c.conn, syncproto.Packet_DENT_V2)
+		if err != nil {
+			c.abort(err, "list_v2 response protocol error")
+			return nil, &PathError{
+				Op:   "list_v2_dent",
+				Path: name,
+				Err:  err,
+			}
+		}
+		if st == nil {
+			break
+		}
+
+		nb := make([]byte, st.Namelen)
+		if _, err := io.ReadFull(c.conn, nb); err != nil {
+			c.abort(err, "list_v2 response protocol error")
+			return nil, &PathError{
+				Op:   "list_v2_dent",
+				Path: name,
+				Err:  adbproto.ProtocolErrorf("read dent_v2 name: %w", err),
+			}
+		}
+		if string(nb) == "." || string(nb) == ".." {
+			continue
+		}
+
+		if st.Error != 0 {
+			// this error comes from lstat, so it will keep returning more
+			// dirents which we aren't reading since we return on the first
+			// error
+			//
+			// to match the stdlib os.ReadDir, we'll return the error
+			// immediately, unless it's due to the dent not exisitng between
+			// readdir and lstat
+			if adbproto.Errno(st.Error) != adbproto.ENOENT {
+				c.abort(err, "list_v2 dent stat error, not continuing read")
+				return nil, &PathError{
+					Op:   "list_v2_dent",
+					Path: string(nb),
+					Err:  errnoError(adbproto.Errno(st.Error)),
+				}
+			}
+		}
+
+		var fsStat fileInfo
+		fillFileInfoDent2(&fsStat, st, string(nb))
+		de = append(de, dirEntry(&fsStat))
+	}
+	if len(de) == 0 {
+		// opendir error or not found
+	}
+	return de, nil
+}
+
+func (c *syncConn) Send1() error {
+	return errors.ErrUnsupported
+}
+
+func (c *syncConn) Send2() error {
+	return errors.ErrUnsupported
+}
+
+func (c *syncConn) Recv1(name string) error {
+	return errors.ErrUnsupported
 }
