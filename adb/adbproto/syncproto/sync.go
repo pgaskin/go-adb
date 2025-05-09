@@ -2,7 +2,6 @@ package syncproto
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 
@@ -144,20 +143,22 @@ func SyncRequest(conn net.Conn, id PacketID, path string) error {
 	copy(req[0:4], id[:])
 	binary.LittleEndian.PutUint32(req[4:8], uint32(len(path)))
 	copy(req[8:], path)
-	_, err := conn.Write(req)
-	return err
+	if _, err := conn.Write(req); err != nil {
+		return adbproto.ProtocolErrorf("sync request: %w", err)
+	}
+	return nil
 }
 
 func SyncResponse(conn net.Conn) error {
 	b := make([]byte, 4)
 	if _, err := io.ReadFull(conn, b); err != nil {
-		return fmt.Errorf("read response id: %w", err)
+		return adbproto.ProtocolErrorf("read sync response id: %w", err)
 	}
 	if err := SyncResponseCheck(conn, PacketID(b)); err != nil {
 		return err
 	}
 	if id := Packet_OKAY; PacketID(b) != id {
-		return fmt.Errorf("unexpected response id %q (expected %s)", PacketID(b), id)
+		return adbproto.ProtocolErrorf("unexpected sync response id %q (expected %s)", PacketID(b), id)
 	}
 	return nil
 }
@@ -166,16 +167,16 @@ func SyncResponseObject[T any](conn net.Conn, id PacketID) (*T, error) {
 	var obj T
 	b := make([]byte, 4)
 	if _, err := io.ReadFull(conn, b); err != nil {
-		return nil, fmt.Errorf("read response id: %w", err)
+		return nil, adbproto.ProtocolErrorf("read sync response id: %w", err)
 	}
 	if err := SyncResponseCheck(conn, PacketID(b)); err != nil {
 		return nil, err
 	}
 	if PacketID(b) != id && PacketID(b) != Packet_DONE {
-		return nil, fmt.Errorf("unexpected response id %q (expected %s)", PacketID(b), id)
+		return nil, adbproto.ProtocolErrorf("unexpected sync response id %q (expected %s)", PacketID(b), id)
 	}
 	if err := binary.Read(conn, binary.LittleEndian, &obj); err != nil {
-		return nil, fmt.Errorf("read response %s: %w", id, err)
+		return nil, adbproto.ProtocolErrorf("read sync response %s: %w", id, err)
 	}
 	if PacketID(b) == Packet_DONE {
 		return nil, nil
@@ -188,20 +189,20 @@ func SyncResponseCheck(conn net.Conn, id PacketID) error {
 	case Packet_FAIL:
 		var tmp SyncStatus
 		if err := binary.Read(conn, binary.LittleEndian, &tmp); err != nil {
-			return fmt.Errorf("read error response: %w", err)
+			return adbproto.ProtocolErrorf("read sync error response: %w", err)
 		}
 		tmp1 := make([]byte, tmp.Msglen)
 		if _, err := io.ReadFull(conn, tmp1); err != nil {
-			return fmt.Errorf("read error response: %w", err)
+			return adbproto.ProtocolErrorf("read sync error response: %w", err)
 		}
 		return SyncFail(tmp1)
 	case Packet_OKAY:
 		var tmp SyncStatus
 		if err := binary.Read(conn, binary.LittleEndian, &tmp); err != nil {
-			return fmt.Errorf("read okay response: %w", err)
+			return adbproto.ProtocolErrorf("read sync okay response: %w", err)
 		}
 		if tmp.Msglen != 0 {
-			return fmt.Errorf("read okay response: message length must be zero, got %d", tmp.Msglen)
+			return adbproto.ProtocolErrorf("read sync okay response: message length must be zero, got %d", tmp.Msglen)
 		}
 	}
 	return nil
