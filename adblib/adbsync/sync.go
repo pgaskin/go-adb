@@ -817,12 +817,12 @@ func (r *syncConnFileReader) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.conn == nil {
-		return 0, net.ErrClosed
-	}
-
 	if r.err != nil {
 		return 0, r.err
+	}
+
+	if r.conn == nil {
+		return 0, net.ErrClosed
 	}
 
 	n, err := r.r.Read(p)
