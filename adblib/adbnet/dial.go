@@ -21,7 +21,9 @@ import (
 //
 // Note that adbd has a tendency to hang if a unix socket misbehaves, requiring
 // a reboot, so I recommend against using them unless you must (it'd be better
-// to start a process which proxies to it).
+// to start a process which proxies to it). See [b/418203510].
+//
+// [b/418203510]: https://issuetracker.google.com/issues/418203510#comment9
 type Dialer struct {
 	// Server is the device to connect through. It must not be nil.
 	Server adb.Dialer
