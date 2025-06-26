@@ -8,12 +8,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 )
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.h;drc=af6fae67a49070ca75c26ceed5759576eb4d3573
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb_io.cpp;drc=af6fae67a49070ca75c26ceed5759576eb4d3573
 
-const MaxPayload = 1024 * 1024
+const MaxPayload = aproto.MaxPayloadSize
 
 // Feature is an optional feature supported by the device.
 type Feature string
@@ -47,6 +49,10 @@ const (
 	FeatureAppInfo                   = "app_info"      // Add information to track-app (package name, ...)
 	FeatureServerStatus              = "server_status" // Ability to output server status
 )
+
+// note: features are here instead of aproto since although aproto stuff can
+// transmit the feature list with A_CNXN, it doesn't actually care about the
+// contents
 
 // Status is returned by the server.
 type Status [4]byte
