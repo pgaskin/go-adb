@@ -78,8 +78,14 @@ type Server struct {
 	// concurrently.
 	AllowedKeys func(ctx context.Context) iter.Seq[*rsa.PublicKey]
 
+	// If true, the listener will wait for adb services to finish dialing before
+	// continuing to process packets. This makes it match the official
+	// implementation, but has a significant performance and reliability
+	// penalty, especially when re-exposing a remote ADB server.
+	StrictOpenOrdering bool
+
 	// If nonzero, delayed ack will be supported with the specified size.
-	// TODO: DelayedAck int
+	DelayedAck int
 
 	// TODO: handle reverse stuff? might want to snoop forward: and killforward:
 	// services and block them by default as we don't have a good way to open a
@@ -100,6 +106,13 @@ type Server struct {
 	// used for a new connection c. The provided ctx is derived from the base
 	// context and has a ServerContextKey value.
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
+
+	// OpenContext optionally specifies a function that modifies the context
+	// used for a new service connection c. The provided ctx is derived from the
+	// connection context.
+	OpenContext func(ctx context.Context, svc string) context.Context
+
+	// TODO: hooks for handling common per-connection we probably want to log
 
 	deviceBannerOnce sync.Once
 	deviceBannerErr  error
@@ -129,8 +142,11 @@ func (s *Server) LoadBanner(ctx context.Context) error {
 		return ErrServerClosed
 	}
 	s.deviceBannerOnce.Do(sync.OnceFunc(func() {
-		// TODO: add adbproto.FeatureDelayedAck once implemented
-		s.deviceBanner, s.deviceBannerErr = makeDeviceBanner(ctx, s.Dialer)
+		var feat []adbproto.Feature
+		if s.DelayedAck != 0 {
+			feat = append(feat, adbproto.FeatureDelayedAck)
+		}
+		s.deviceBanner, s.deviceBannerErr = makeDeviceBanner(ctx, s.Dialer, feat...)
 	}))
 	return s.deviceBannerErr
 }
@@ -156,6 +172,13 @@ func (s *Server) ListenAndServe() error {
 // Serve accepts incoming connections on the Listener l, creating a new service
 // goroutine for each.
 func (s *Server) Serve(l net.Listener) error {
+	if s.DelayedAck != 0 {
+		panic("delayed ack not implemented") // TODO
+	}
+	if s.DelayedAck < 0 || s.DelayedAck > 0xFFFFFFFF {
+		return fmt.Errorf("delayed ack bytes out of range")
+	}
+
 	lorig := l
 	l = &onceCloseListener{Listener: lorig}
 
@@ -508,10 +531,7 @@ func (t *transport) serve(ctx context.Context) {
 		if debug {
 			tt = time.Now()
 		}
-		if err := t.handle(ctx, pkt); err != nil {
-			t.kick(fmt.Errorf("handle %s: %w", pkt.Command, err))
-			return
-		}
+		t.handle(ctx, pkt)
 		if debug {
 			if td := time.Since(tt); td > time.Millisecond*250 {
 				debugStatus(t, "warning: slow handle (%s)", td)
@@ -520,7 +540,7 @@ func (t *transport) serve(ctx context.Context) {
 	}
 }
 
-func (t *transport) handle(ctx context.Context, pkt aproto.Packet) error {
+func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 	switch pkt.Command {
 	case aproto.A_CNXN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=407-433;drc=61197364367c9e404c7da6900658f1b16c42d0da
 		_, _, features := parseBanner(string(pkt.Payload))
@@ -538,40 +558,40 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) error {
 		if t.server.UseTLS {
 			// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=318-325;drc=61197364367c9e404c7da6900658f1b16c42d0da
 			t.sendAuthPacket(aproto.A_STLS, aproto.STLSVersionMin, 0, nil)
-			return nil
+			return
 		}
 
 		if t.server.AllowedKeys != nil {
 			t.sendAuthRequest()
-			return nil
+			return
 		}
 
 		t.sendAuthConnect()
-		return nil
+		return
 
 	case aproto.A_STLS:
 		if !t.server.UseTLS {
-			return nil // ignore stls packets (the actual adb impl doesn't, but that code path isn't used as the adb server needs to send the stls first)
+			return // ignore stls packets (the actual adb impl doesn't, but that code path isn't used as the adb server needs to send the stls first)
 		}
 
 		if !t.doTLSHandshake(ctx) {
 			// only allow a single attempt
 			t.kick(fmt.Errorf("tls handshake failed"))
-			return nil
+			return
 		}
 
 		t.sendAuthConnect()
-		return nil
+		return
 
 	case aproto.A_AUTH:
 		if t.server.UseTLS {
-			return nil // ignore auth packets
+			return // ignore auth packets
 		}
 		if t.server.AllowedKeys == nil {
-			return nil
+			return
 		}
 		if t.isAuthenticated() {
-			return nil
+			return
 		}
 
 		// note: when the adb host daemon has vendor keys loaded, it will send
@@ -588,7 +608,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) error {
 				debugStatus(t, "verified signature with pubkey n=%s e=%d", key.N, key.E)
 				t.failedAuthAttempts = 0
 				t.sendAuthConnect()
-				return nil
+				return
 			}
 
 			if t.failedAuthAttempts++; t.failedAuthAttempts > 256 {
@@ -597,7 +617,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) error {
 			}
 
 			t.sendAuthRequest()
-			return nil
+			return
 
 		case aproto.AuthRSAPublicKey:
 			if t.server.PromptKey != nil {
@@ -605,30 +625,85 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) error {
 				key, name, err := aproto.ParsePublicKey(buf)
 				if err != nil {
 					debugStatus(t, "ignoring invalid pubkey %q: %v", string(buf), err)
-					return nil
+					return
 				}
 				t.server.PromptKey(ctx, name, aproto.GoPublicKey(key))
 			}
-			return nil
+			return
 		}
 
-	case aproto.A_SYNC:
-		// TODO
+	case aproto.A_SYNC: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/protocol.md;l=191-207;drc=593dc053eb97047637ff813081d9c2de55e17a46
+		debugStatus(t, "ignoring invalid SYNC packet (this is never valid on the wire)")
+		return
 
 	case aproto.A_OPEN:
-		// TODO
+		if !t.isAuthenticated() {
+			return
+		}
+		if pkt.Arg0 == 0 {
+			return
+		}
+		if pkt.Arg1 != uint32(t.server.DelayedAck) {
+			debugStatus(t, "unexpected OPEN delayed acks (exp=%d act=%d)", t.server.DelayedAck, pkt.Arg1)
+			t.sendAuthPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
+			return
+		}
+
+		svc := string(stripTrailingNulls(pkt.Payload))
+
+		// TODO: implement tracking of streams
+		// TODO: delayed ack
+
+		fn := func() {
+			sctx := ctx
+			if t.server.OpenContext != nil {
+				sctx = t.server.OpenContext(sctx, svc)
+				if sctx == nil {
+					panic("OpenContext returned nil")
+				}
+			}
+
+			debugStatus(t, "[%d] dialing %q", pkt.Arg0, svc)
+			conn, err := t.server.Dialer.DialADB(sctx, svc)
+			if err != nil {
+				debugStatus(t, "[%d] failed to open service %q: %v", pkt.Arg0, svc, err)
+				t.sendAuthPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
+				return
+			}
+			debugStatus(t, "[%d] opened %q", pkt.Arg0, svc)
+
+			// TODO: implement stream stuff
+			conn.Close()
+			t.sendAuthPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
+		}
+		if t.server.StrictOpenOrdering {
+			fn()
+		} else {
+			go fn()
+		}
 
 	case aproto.A_OKAY:
+		if !t.isAuthenticated() {
+			return
+		}
+
 		// TODO
 
 	case aproto.A_CLSE:
+		if !t.isAuthenticated() {
+			return
+		}
+
 		// TODO
 
 	case aproto.A_WRTE:
+		if !t.isAuthenticated() {
+			return
+		}
+
 		// TODO
 	}
 	debugStatus(t, "unhandled %s packet", pkt.Command)
-	return nil
 }
 
 func (t *transport) sendAuthRequest() {
