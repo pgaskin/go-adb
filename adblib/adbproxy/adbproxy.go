@@ -101,8 +101,10 @@ type Server struct {
 	// proxied port on the underlying adb server... it's probably better to do
 	// this as a wrapper around the dialer instead of in Server directly to keep
 	// things clean... but then we'll need to expose something to send an open
-	// to a connected transport... probably need to look at it more closely to
-	// ensure I understand it correctly
+	// to a connected transport (add a helper to this package which takes a
+	// context passed down from a *transport and allows doing a DialADB on the
+	// client?)... probably need to look at it more closely to ensure I
+	// understand it correctly
 
 	// BaseContext optionally specifies a function that returns the base context
 	// for incoming requests on this server. The provided Listener is the
