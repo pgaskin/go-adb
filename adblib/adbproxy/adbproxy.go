@@ -91,7 +91,9 @@ type Server struct {
 	// penalty, especially when re-exposing a remote ADB server.
 	StrictOpenOrdering bool
 
-	// If nonzero, delayed ack will be supported with the specified size.
+	// If nonzero, delayed ack will be supported with the specified size. This
+	// must also be supported by the Dialer (if backed by adbd, ADB_BURST_MODE
+	// must be set).
 	DelayedAck int
 
 	// TODO: handle reverse stuff? might want to snoop forward: and killforward:
@@ -388,6 +390,7 @@ type stream struct {
 	ready  chan struct{}
 	mu     sync.Mutex
 	asb    int64 // available send bytes (can be negative)
+	wqueue chan []byte
 }
 
 func (s *Server) newTransport(conn net.Conn) *transport {
@@ -733,7 +736,8 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 					remote: pkt.Arg0,
 					device: conn,
 					asb:    int64(t.server.DelayedAck),
-					ready:  make(chan struct{}),
+					ready:  make(chan struct{}, 1),
+					wqueue: make(chan []byte, 1),
 				}
 				t.streams[stream] = struct{}{}
 				return stream
@@ -744,6 +748,23 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			} else {
 				t.sendPacket(nil, aproto.A_OKAY, stream.local, stream.remote, nil)
 			}
+
+			go func() {
+				buf := make([]byte, aproto.MessageSize+t.maxPayloadSize)
+				for data := range stream.wqueue {
+					if _, err := stream.device.Write(data); err != nil {
+						debugStatus(t, "[%d] failed to write to local device socket: %v", stream.local, err)
+						// TODO: is this the correct behaviour, or do we just ignore it?
+						stream.device.Close()
+						t.sendPacket(nil, aproto.A_CLSE, stream.local, stream.remote, nil)
+						// note: the client will send a CLSE back
+						return
+					}
+					// tell the remote we're ready for another WRTE
+					// TODO: do we need to care about delayed acks here?
+					buf = t.sendPacket(buf, aproto.A_OKAY, stream.local, stream.remote, nil)
+				}
+			}()
 
 			go func() {
 				buf := make([]byte, aproto.MessageSize+t.maxPayloadSize)
@@ -763,6 +784,9 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 							defer stream.mu.Unlock()
 							return stream.asb
 						}()
+						if asb == 0 {
+							continue
+						}
 						if int64(len(payload)) > asb {
 							payload = payload[:asb]
 						}
@@ -770,10 +794,11 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 
 					n, err := stream.device.Read(payload)
 					if err != nil {
-						debugStatus(t, "[%d] failed to read local device socket: %v", stream.local, err)
+						debugStatus(t, "[%d] failed to read from local device socket: %v", stream.local, err)
 						// TODO: is this the correct behaviour, or do we just ignore it?
 						stream.device.Close()
 						t.sendPacket(nil, aproto.A_CLSE, stream.local, stream.remote, nil)
+						// note: the client will send a CLSE back
 						return
 					}
 					if n > 0 {
@@ -805,7 +830,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 					}
 				}
 			}()
-			stream.ready <- struct{}{}
+			stream.notifyReady()
 		}
 		if t.server.StrictOpenOrdering {
 			fn()
@@ -843,10 +868,10 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			if t.server.DelayedAck != 0 {
 				stream.asb += int64(acked)
 				if stream.asb > 0 {
-					stream.ready <- struct{}{}
+					stream.notifyReady()
 				}
 			} else {
-				stream.ready <- struct{}{}
+				stream.notifyReady()
 			}
 		}()
 		return
@@ -866,6 +891,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 		}
 
 		stream.device.Close()
+		stream.notifyReady()
 		func() {
 			t.streamsMu.Lock()
 			defer t.streamsMu.Unlock()
@@ -887,7 +913,8 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			break
 		}
 
-		// TODO
+		stream.wqueue <- slices.Clone(pkt.Payload) // TODO: optimize this, refactor
+		return
 	}
 	debugStatus(t, "unhandled %s packet", pkt.Command)
 }
@@ -1149,6 +1176,15 @@ func generateX509Certificate(pkey *rsa.PrivateKey) ([]byte, error) {
 		SubjectKeyId: []byte("hash"),
 	}
 	return x509.CreateCertificate(crand.Reader, cert, cert, &pkey.PublicKey, pkey)
+}
+
+func (s *stream) notifyReady() {
+	select {
+	case s.ready <- struct{}{}:
+		// notified
+	default:
+		// already have a ready queued (chan buffer is 1)
+	}
 }
 
 func stripTrailingNulls(b []byte) []byte {
