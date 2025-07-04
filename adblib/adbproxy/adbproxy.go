@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 )
 
+// TODO: refactor asocket logic (as a wrapper around readwriteclosers) into adb/aproto since we'll probably use it for client conns too
 // TODO: refactor core server packet handling into adb/adbtcpip
 
 var (
@@ -173,7 +175,7 @@ func (s *Server) ListenAndServe() error {
 // goroutine for each.
 func (s *Server) Serve(l net.Listener) error {
 	if s.DelayedAck != 0 {
-		panic("delayed ack not implemented") // TODO
+		panic("delayed ack not implemented") // TODO: figure out the rest of it, refactor (also see https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/delayed_ack.md)
 	}
 	if s.DelayedAck < 0 || s.DelayedAck > 0xFFFFFFFF {
 		return fmt.Errorf("delayed ack bytes out of range")
@@ -354,7 +356,7 @@ type transport struct {
 	conn   net.Conn
 	rw     io.ReadWriter
 
-	mu              sync.Mutex
+	mu              sync.Mutex // this MUST not be held while waiting on I/O or external stuff
 	kicked          bool
 	maxPayloadSize  uint32
 	protocolVersion uint32
@@ -363,9 +365,22 @@ type transport struct {
 	authenticated   bool
 	remoteFeatures  map[adbproto.Feature]struct{}
 
+	streamsMu sync.Mutex
+	stream    uint32
+	streams   map[*stream]struct{}
+
 	// no mutex for these since only accessed from main serve goroutine
 	authBuf            []byte
 	failedAuthAttempts uint64
+}
+
+type stream struct {
+	local  uint32
+	remote uint32
+	device net.Conn
+	ready  chan struct{}
+	mu     sync.Mutex
+	asb    int64 // available send bytes (can be negative)
 }
 
 func (s *Server) newTransport(conn net.Conn) *transport {
@@ -384,7 +399,23 @@ func (s *Server) newTransport(conn net.Conn) *transport {
 
 func (t *transport) close() error {
 	debugStatus(t, "close")
-	return t.conn.Close()
+	cerr := t.conn.Close()
+
+	t.streamsMu.Lock()
+	defer t.streamsMu.Unlock()
+	var errs []error
+	for s := range t.streams {
+		// TODO: refactor?
+		if err := s.device.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		delete(t.streams, s)
+	}
+
+	if serr := errors.Join(errs...); serr != nil {
+		cerr = errors.Join(cerr, fmt.Errorf("close stream device conns: %w", serr))
+	}
+	return cerr
 }
 
 func (t *transport) kick(err error) {
@@ -417,7 +448,7 @@ func (t *transport) error() error {
 func (t *transport) numStreams() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return 0 // TODO
+	return len(t.streams)
 }
 
 func (t *transport) getToken(generate bool) []byte {
@@ -458,6 +489,25 @@ func (t *transport) isKicked() bool {
 	return t.kicked
 }
 
+func (t *transport) findLocalSocket(local, remote uint32) *stream {
+	t.streamsMu.Lock()
+	defer t.streamsMu.Unlock()
+	for s := range t.streams {
+		if (remote == 0 || s.remote == remote) && s.local == local {
+			return s
+		}
+	}
+	return nil
+}
+
+func (t *transport) write(buf []byte) {
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+	if _, err := t.rw.Write(buf); err != nil {
+		t.kick(err)
+	}
+}
+
 // send sends pkt, reusing buf if possible.
 func (t *transport) send(buf []byte, pkt aproto.Packet) []byte {
 	debugPacket(t, false, pkt)
@@ -471,12 +521,7 @@ func (t *transport) send(buf []byte, pkt aproto.Packet) []byte {
 		if err != nil {
 			panic(err)
 		}
-		t.sendMu.Lock()
-		defer t.sendMu.Unlock()
-		if _, err := t.rw.Write(buf); err != nil {
-			t.kick(err)
-			return buf
-		}
+		t.write(buf)
 	}
 	return buf
 }
@@ -636,7 +681,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 		debugStatus(t, "ignoring invalid SYNC packet (this is never valid on the wire)")
 		return
 
-	case aproto.A_OPEN:
+	case aproto.A_OPEN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=500-552;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
 		if !t.isAuthenticated() {
 			return
 		}
@@ -667,38 +712,174 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			conn, err := t.server.Dialer.DialADB(sctx, svc)
 			if err != nil {
 				debugStatus(t, "[%d] failed to open service %q: %v", pkt.Arg0, svc, err)
-				t.sendAuthPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
+				t.sendPacket(nil, aproto.A_CLSE, 0, pkt.Arg0, nil)
 				return
 			}
 			debugStatus(t, "[%d] opened %q", pkt.Arg0, svc)
 
-			// TODO: implement stream stuff
-			conn.Close()
-			t.sendAuthPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
+			// TODO: refactor into t.newStream
+			stream := func() *stream {
+				t.streamsMu.Lock()
+				defer t.streamsMu.Unlock()
+				if t.streams == nil {
+					t.streams = make(map[*stream]struct{})
+				}
+				t.stream++
+				stream := &stream{
+					local:  t.stream,
+					remote: pkt.Arg0,
+					device: conn,
+					asb:    int64(t.server.DelayedAck),
+					ready:  make(chan struct{}),
+				}
+				t.streams[stream] = struct{}{}
+				return stream
+			}()
+
+			if t.server.DelayedAck != 0 {
+				t.sendPacket(nil, aproto.A_OKAY, stream.local, stream.remote, binary.LittleEndian.AppendUint32(nil, uint32(t.server.DelayedAck)))
+			} else {
+				t.sendPacket(nil, aproto.A_OKAY, stream.local, stream.remote, nil)
+			}
+
+			go func() {
+				buf := make([]byte, aproto.MessageSize+t.getMaxPayloadSize())
+				for {
+					if t.server.DelayedAck == 0 || func() bool {
+						stream.mu.Lock()
+						defer stream.mu.Unlock()
+						return stream.asb <= 0
+					}() {
+						<-stream.ready
+					}
+
+					payload := buf[aproto.MessageSize:]
+					if t.server.DelayedAck != 0 {
+						asb := func() int64 {
+							stream.mu.Lock()
+							defer stream.mu.Unlock()
+							return stream.asb
+						}()
+						if int64(len(payload)) > asb {
+							payload = payload[:asb]
+						}
+					}
+
+					n, err := stream.device.Read(payload)
+					if err != nil {
+						debugStatus(t, "[%d] failed to read local device socket: %v", stream.local, err)
+						// TODO: is this the correct behaviour, or do we just ignore it?
+						stream.device.Close()
+						t.sendPacket(nil, aproto.A_CLSE, stream.local, stream.remote, nil)
+						return
+					}
+					if n > 0 {
+						msg := aproto.Message{
+							Command:    aproto.A_WRTE,
+							Arg0:       stream.local,
+							Arg1:       stream.remote,
+							DataLength: uint32(n),
+							DataCheck:  aproto.Checksum(payload[:n]),
+							Magic:      uint32(aproto.A_WRTE) ^ 0xFFFFFFFF,
+						}
+						if _, err := msg.AppendBinary(buf[:0]); err != nil {
+							panic(err)
+						}
+						debugPacket(t, false, aproto.Packet{
+							Message: msg,
+							Payload: payload[:n],
+						})
+						t.write(buf[:aproto.MessageSize+msg.DataLength])
+						if t.server.DelayedAck != 0 {
+							func() {
+								stream.mu.Lock()
+								defer stream.mu.Unlock()
+								stream.asb -= int64(n)
+							}()
+						}
+					}
+				}
+			}()
+			stream.ready <- struct{}{}
 		}
 		if t.server.StrictOpenOrdering {
 			fn()
 		} else {
 			go fn()
 		}
+		return
 
-	case aproto.A_OKAY:
+	case aproto.A_OKAY: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=554-592;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
 		if !t.isAuthenticated() {
 			return
 		}
-
-		// TODO
-
-	case aproto.A_CLSE:
-		if !t.isAuthenticated() {
+		if pkt.Arg0 == 0 || pkt.Arg1 == 0 {
 			return
 		}
 
-		// TODO
+		var acked int32
+		if len(pkt.Payload) != 0 {
+			if len(pkt.Payload) != 4 {
+				debugStatus(t, "invalid OKAY payload size (%d)", len(pkt.Payload))
+				return
+			}
+			acked = int32(binary.LittleEndian.Uint32(pkt.Payload))
+		}
 
-	case aproto.A_WRTE:
+		stream := t.findLocalSocket(pkt.Arg1, 0)
+		if stream == nil {
+			// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
+			break
+		}
+
+		func() {
+			stream.mu.Lock()
+			defer stream.mu.Unlock()
+			if t.server.DelayedAck != 0 {
+				stream.asb += int64(acked)
+				if stream.asb > 0 {
+					stream.ready <- struct{}{}
+				}
+			} else {
+				stream.ready <- struct{}{}
+			}
+		}()
+		return
+
+	case aproto.A_CLSE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=594-616;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
 		if !t.isAuthenticated() {
 			return
+		}
+		if pkt.Arg1 == 0 {
+			return
+		}
+
+		stream := t.findLocalSocket(pkt.Arg1, pkt.Arg0)
+		if stream == nil {
+			debugStatus(t, "cannot find stream to close, ignoring (remote=%d local=%d)", pkt.Arg0, pkt.Arg1)
+			return
+		}
+
+		stream.device.Close()
+		func() {
+			t.streamsMu.Lock()
+			defer t.streamsMu.Unlock()
+			delete(t.streams, stream)
+		}()
+		return
+
+	case aproto.A_WRTE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=618-625;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
+		if !t.isAuthenticated() {
+			return
+		}
+		if pkt.Arg0 == 0 || pkt.Arg1 == 0 {
+			return
+		}
+
+		stream := t.findLocalSocket(pkt.Arg1, pkt.Arg0)
+		if stream == nil {
+			debugStatus(t, "cannot find stream to write, ignoring (remote=%d local=%d)", pkt.Arg0, pkt.Arg1)
+			break
 		}
 
 		// TODO
@@ -739,6 +920,21 @@ func (t *transport) sendAuthPacket(command aproto.Command, arg0, arg1 uint32, da
 		pkt.DataCheck = aproto.Checksum(pkt.Payload)
 	}
 	t.authBuf = t.send(t.authBuf, pkt)
+}
+
+func (t *transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 uint32, data []byte) []byte {
+	pkt := aproto.Packet{
+		Message: aproto.Message{
+			Command:    command,
+			Arg0:       arg0,
+			Arg1:       arg1,
+			DataLength: uint32(len(data)),
+			DataCheck:  aproto.Checksum(data),
+			Magic:      uint32(command) ^ 0xFFFFFFFF,
+		},
+		Payload: data,
+	}
+	return t.send(buf, pkt)
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=513-557;drc=61197364367c9e404c7da6900658f1b16c42d0da
