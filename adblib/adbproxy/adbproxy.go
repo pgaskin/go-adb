@@ -361,15 +361,6 @@ type transport struct {
 	conn   net.Conn
 	rw     io.ReadWriter
 
-	mu              sync.Mutex // this MUST not be held while waiting on I/O or external stuff
-	kicked          bool
-	maxPayloadSize  uint32
-	protocolVersion uint32
-	err             error
-	token           []byte
-	authenticated   bool
-	remoteFeatures  map[adbproto.Feature]struct{}
-
 	streamsMu sync.Mutex
 	stream    uint32
 	streams   map[*stream]struct{}
@@ -377,6 +368,17 @@ type transport struct {
 	// no mutex for these since only accessed from main serve goroutine
 	authBuf            []byte
 	failedAuthAttempts uint64
+
+	// no mutex for these since only modified from main serve goroutine while !authenticated
+	token           []byte
+	remoteFeatures  map[adbproto.Feature]struct{}
+	maxPayloadSize  uint32
+	protocolVersion uint32
+
+	mu            sync.Mutex // this MUST not be held while waiting on I/O or external stuff
+	kicked        bool
+	err           error
+	authenticated bool
 }
 
 type stream struct {
@@ -457,8 +459,6 @@ func (t *transport) numStreams() int {
 }
 
 func (t *transport) getToken(generate bool) []byte {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	if generate || t.token == nil {
 		token := make([]byte, aproto.AuthTokenSize)
 		if _, err := crand.Read(token); err != nil {
@@ -468,18 +468,6 @@ func (t *transport) getToken(generate bool) []byte {
 		t.token = token
 	}
 	return t.token
-}
-
-func (t *transport) getProtocolVersion() uint32 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.protocolVersion
-}
-
-func (t *transport) getMaxPayloadSize() uint32 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.maxPayloadSize
 }
 
 func (t *transport) isAuthenticated() bool {
@@ -517,7 +505,7 @@ func (t *transport) write(buf []byte) {
 func (t *transport) send(buf []byte, pkt aproto.Packet) []byte {
 	debugPacket(t, false, pkt)
 	if !t.isKicked() {
-		if len(pkt.Payload) > int(t.getMaxPayloadSize()) {
+		if len(pkt.Payload) > int(t.maxPayloadSize) {
 			t.kick(fmt.Errorf("%s packet is too long for remote", pkt.Command))
 			return buf
 		}
@@ -539,7 +527,7 @@ func (t *transport) serve(ctx context.Context) {
 		buf []byte
 	)
 	for !t.isKicked() {
-		if n := int(t.getMaxPayloadSize()); len(buf) != n {
+		if n := int(t.maxPayloadSize); len(buf) != n {
 			buf = slices.Grow(buf[:0], n)[:n]
 		}
 		if _, err := io.ReadFull(t.rw, msg[:]); err != nil {
@@ -593,25 +581,27 @@ func (t *transport) serve(ctx context.Context) {
 func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 	switch pkt.Command {
 	case aproto.A_CNXN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=407-433;drc=61197364367c9e404c7da6900658f1b16c42d0da
-		_, _, features := parseBanner(string(pkt.Payload))
-
-		fmap := map[adbproto.Feature]struct{}{}
-		for _, f := range features {
-			fmap[f] = struct{}{}
-		}
 		func() {
 			t.mu.Lock()
 			defer t.mu.Unlock()
-			t.remoteFeatures = fmap
-			if v := min(pkt.Arg0, protocolVersionMax); v != t.protocolVersion {
-				t.protocolVersion = v
-				debugStatus(t, "changed protocol version to 0x%08X", t.protocolVersion)
-			}
-			if v := min(pkt.Arg1, aproto.MaxPayloadSize); v != t.maxPayloadSize {
-				t.maxPayloadSize = v
-				debugStatus(t, "changed max payload size to %d", t.maxPayloadSize)
-			}
+			t.authenticated = false
+			t.failedAuthAttempts = 0
 		}()
+
+		_, _, features := parseBanner(string(pkt.Payload))
+
+		t.remoteFeatures = map[adbproto.Feature]struct{}{}
+		for _, f := range features {
+			t.remoteFeatures[f] = struct{}{}
+		}
+		if v := min(pkt.Arg0, protocolVersionMax); v != t.protocolVersion {
+			t.protocolVersion = v
+			debugStatus(t, "changed protocol version to 0x%08X", t.protocolVersion)
+		}
+		if v := min(pkt.Arg1, aproto.MaxPayloadSize); v != t.maxPayloadSize {
+			t.maxPayloadSize = v
+			debugStatus(t, "changed max payload size to %d", t.maxPayloadSize)
+		}
 
 		if t.server.UseTLS {
 			// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=318-325;drc=61197364367c9e404c7da6900658f1b16c42d0da
@@ -756,7 +746,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			}
 
 			go func() {
-				buf := make([]byte, aproto.MessageSize+t.getMaxPayloadSize())
+				buf := make([]byte, aproto.MessageSize+t.maxPayloadSize)
 				for {
 					if t.server.DelayedAck == 0 || func() bool {
 						stream.mu.Lock()
@@ -794,7 +784,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 							DataLength: uint32(n),
 							Magic:      uint32(aproto.A_WRTE) ^ 0xFFFFFFFF,
 						}
-						if t.getProtocolVersion() < aproto.VersionSkipChecksum {
+						if t.protocolVersion < aproto.VersionSkipChecksum {
 							msg.DataCheck = aproto.Checksum(payload[:n])
 						}
 						if _, err := msg.AppendBinary(buf[:0]); err != nil {
@@ -913,7 +903,7 @@ func (t *transport) sendAuthConnect() {
 		defer t.mu.Unlock()
 		t.authenticated = true
 	}()
-	t.authBuf = t.sendPacket(t.authBuf, aproto.A_CNXN, t.getProtocolVersion(), t.getMaxPayloadSize(), []byte(t.server.deviceBanner))
+	t.authBuf = t.sendPacket(t.authBuf, aproto.A_CNXN, t.protocolVersion, t.maxPayloadSize, []byte(t.server.deviceBanner))
 	debugStatus(t, "sent banner")
 }
 
@@ -930,7 +920,7 @@ func (t *transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 ui
 		},
 		Payload: data,
 	}
-	if t.getProtocolVersion() < aproto.VersionSkipChecksum {
+	if t.protocolVersion < aproto.VersionSkipChecksum {
 		pkt.DataCheck = aproto.Checksum(pkt.Payload)
 	}
 	return t.send(buf, pkt)
