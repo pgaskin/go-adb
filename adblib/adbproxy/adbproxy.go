@@ -51,6 +51,11 @@ var (
 	ServerContextKey = &contextKey{"server"} // *Server
 )
 
+const (
+	protocolVersionMin = aproto.VersionMin
+	protocolVersionMax = aproto.VersionSkipChecksum
+)
+
 // Server serves an ADB TCP/IP server for an [adb.Dialer].
 type Server struct {
 	// Addr is the TCP address to listen on.
@@ -390,7 +395,7 @@ func (s *Server) newTransport(conn net.Conn) *transport {
 		conn:            conn,
 		rw:              conn,
 		maxPayloadSize:  aproto.MaxPayloadSizeV1, // legacy v1 payload size until we know how much the remote can accept
-		protocolVersion: aproto.VersionMin,       // min protocol version for maximum compatibility
+		protocolVersion: protocolVersionMin,      // min protocol version for maximum compatibility
 	}
 	debugStatus(t, "new")
 	s.trackTransport(t, true)
@@ -598,11 +603,19 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			t.mu.Lock()
 			defer t.mu.Unlock()
 			t.remoteFeatures = fmap
+			if v := min(pkt.Arg0, protocolVersionMax); v != t.protocolVersion {
+				t.protocolVersion = v
+				debugStatus(t, "changed protocol version to 0x%08X", t.protocolVersion)
+			}
+			if v := min(pkt.Arg1, aproto.MaxPayloadSize); v != t.maxPayloadSize {
+				t.maxPayloadSize = v
+				debugStatus(t, "changed max payload size to %d", t.maxPayloadSize)
+			}
 		}()
 
 		if t.server.UseTLS {
 			// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=318-325;drc=61197364367c9e404c7da6900658f1b16c42d0da
-			t.sendAuthPacket(aproto.A_STLS, aproto.STLSVersionMin, 0, nil)
+			t.authBuf = t.sendPacket(t.authBuf, aproto.A_STLS, aproto.STLSVersionMin, 0, nil)
 			return
 		}
 
@@ -690,7 +703,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 		}
 		if pkt.Arg1 != uint32(t.server.DelayedAck) {
 			debugStatus(t, "unexpected OPEN delayed acks (exp=%d act=%d)", t.server.DelayedAck, pkt.Arg1)
-			t.sendAuthPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
+			t.authBuf = t.sendPacket(t.authBuf, aproto.A_CLSE, 0, pkt.Arg0, nil)
 			return
 		}
 
@@ -779,8 +792,10 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 							Arg0:       stream.local,
 							Arg1:       stream.remote,
 							DataLength: uint32(n),
-							DataCheck:  aproto.Checksum(payload[:n]),
 							Magic:      uint32(aproto.A_WRTE) ^ 0xFFFFFFFF,
+						}
+						if t.getProtocolVersion() < aproto.VersionSkipChecksum {
+							msg.DataCheck = aproto.Checksum(payload[:n])
 						}
 						if _, err := msg.AppendBinary(buf[:0]); err != nil {
 							panic(err)
@@ -888,7 +903,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 }
 
 func (t *transport) sendAuthRequest() {
-	t.sendAuthPacket(aproto.A_AUTH, aproto.AuthToken, 0, t.getToken(true))
+	t.authBuf = t.sendPacket(t.authBuf, aproto.A_AUTH, aproto.AuthToken, 0, t.getToken(true))
 }
 
 func (t *transport) sendAuthConnect() {
@@ -898,14 +913,13 @@ func (t *transport) sendAuthConnect() {
 		defer t.mu.Unlock()
 		t.authenticated = true
 	}()
-	t.sendAuthPacket(aproto.A_CNXN, t.getProtocolVersion(), t.getMaxPayloadSize(), []byte(t.server.deviceBanner))
+	t.authBuf = t.sendPacket(t.authBuf, aproto.A_CNXN, t.getProtocolVersion(), t.getMaxPayloadSize(), []byte(t.server.deviceBanner))
 	debugStatus(t, "sent banner")
 }
 
-// sendAuthPacket sends a connection/auth packet.
-//
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=564-583;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func (t *transport) sendAuthPacket(command aproto.Command, arg0, arg1 uint32, data []byte) {
+// https://android-review.googlesource.com/c/platform/system/core/+/568123
+func (t *transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 uint32, data []byte) []byte {
 	pkt := aproto.Packet{
 		Message: aproto.Message{
 			Command:    command,
@@ -918,21 +932,6 @@ func (t *transport) sendAuthPacket(command aproto.Command, arg0, arg1 uint32, da
 	}
 	if t.getProtocolVersion() < aproto.VersionSkipChecksum {
 		pkt.DataCheck = aproto.Checksum(pkt.Payload)
-	}
-	t.authBuf = t.send(t.authBuf, pkt)
-}
-
-func (t *transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 uint32, data []byte) []byte {
-	pkt := aproto.Packet{
-		Message: aproto.Message{
-			Command:    command,
-			Arg0:       arg0,
-			Arg1:       arg1,
-			DataLength: uint32(len(data)),
-			DataCheck:  aproto.Checksum(data),
-			Magic:      uint32(command) ^ 0xFFFFFFFF,
-		},
-		Payload: data,
 	}
 	return t.send(buf, pkt)
 }
