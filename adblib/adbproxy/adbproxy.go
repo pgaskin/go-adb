@@ -8,11 +8,15 @@ import (
 	"crypto"
 	crand "crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"math/big"
 	"math/rand"
 	"net"
 	"os"
@@ -60,9 +64,13 @@ type Server struct {
 	UseTLS bool
 
 	// If not nil and UseTLS is false, this will be called when a new key is
-	// presented by the client. For TLS connections, the key should be sent
-	// using the pairing protocol. This function must be safe to be called
-	// concurrently.
+	// presented by the client. This function must be safe to be called
+	// concurrently, but will block individual transports.
+	//
+	// For TLS connections, the key should be sent beforehand using the pairing
+	// protocol, but for flexibility, if AllowedKeys is not nil, this will be
+	// called if the presented key is not in AllowedKeys, then AllowedKeys will
+	// be checked again afterwards.
 	PromptKey func(ctx context.Context, name string, key *rsa.PublicKey)
 
 	// If not nil, this will be called to get the allowed public keys. If nil,
@@ -96,6 +104,10 @@ type Server struct {
 	deviceBannerOnce sync.Once
 	deviceBannerErr  error
 	deviceBanner     string
+
+	tlskeyOnce sync.Once
+	tlskeyErr  error
+	tlskey     *rsa.PrivateKey // so we don't waste time generating a new one on every connection
 
 	shuttingDown  atomic.Bool
 	listenerGroup sync.WaitGroup
@@ -163,6 +175,15 @@ func (s *Server) Serve(l net.Listener) error {
 
 	if err := s.LoadBanner(lctx); err != nil {
 		return fmt.Errorf("load banner: %w", err)
+	}
+
+	if s.UseTLS {
+		s.tlskeyOnce.Do(func() {
+			s.tlskey, s.tlskeyErr = rsa.GenerateKey(crand.Reader, aproto.PublicKeyModulusSize*8)
+		})
+		if err := s.tlskeyErr; err != nil {
+			return fmt.Errorf("generate tls key: %w", err)
+		}
 	}
 
 	var delay time.Duration
@@ -307,7 +328,8 @@ type transport struct {
 	server *Server
 
 	sendMu sync.Mutex
-	rwc    io.ReadWriteCloser
+	conn   net.Conn
+	rw     io.ReadWriter
 
 	mu              sync.Mutex
 	kicked          bool
@@ -323,29 +345,32 @@ type transport struct {
 	failedAuthAttempts uint64
 }
 
-func (s *Server) newTransport(rwc io.ReadWriteCloser) *transport {
+func (s *Server) newTransport(conn net.Conn) *transport {
 	t := &transport{
 		tid:             s.tid.Add(1),
 		server:          s,
-		rwc:             rwc,
+		conn:            conn,
+		rw:              conn,
 		maxPayloadSize:  aproto.MaxPayloadSizeV1, // legacy v1 payload size until we know how much the remote can accept
 		protocolVersion: aproto.VersionMin,       // min protocol version for maximum compatibility
 	}
-	if debug {
-		fmt.Printf("[%d] new\n", t.tid)
-	}
+	debugStatus(t, "new")
 	s.trackTransport(t, true)
 	return t
 }
 
 func (t *transport) close() error {
-	fmt.Printf("[%d] close\n", t.tid)
-	return t.rwc.Close()
+	debugStatus(t, "close")
+	return t.conn.Close()
 }
 
 func (t *transport) kick(err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.kickLocked(err)
+}
+
+func (t *transport) kickLocked(err error) {
 	if err != nil {
 		if t.err == nil {
 			debugStatus(t, "error: %v", err)
@@ -376,10 +401,12 @@ func (t *transport) getToken(generate bool) []byte {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if generate || t.token == nil {
-		t.token = make([]byte, aproto.AuthTokenSize)
-		if _, err := crand.Read(t.token); err != nil {
-			panic(err)
+		token := make([]byte, aproto.AuthTokenSize)
+		if _, err := crand.Read(token); err != nil {
+			t.kickLocked(fmt.Errorf("failed to generate token: %w", err)) // this should never fail
+			return nil
 		}
+		t.token = token
 	}
 	return t.token
 }
@@ -423,7 +450,7 @@ func (t *transport) send(buf []byte, pkt aproto.Packet) []byte {
 		}
 		t.sendMu.Lock()
 		defer t.sendMu.Unlock()
-		if _, err := t.rwc.Write(buf); err != nil {
+		if _, err := t.rw.Write(buf); err != nil {
 			t.kick(err)
 			return buf
 		}
@@ -442,7 +469,7 @@ func (t *transport) serve(ctx context.Context) {
 		if n := int(t.getMaxPayloadSize()); len(buf) != n {
 			buf = slices.Grow(buf[:0], n)[:n]
 		}
-		if _, err := io.ReadFull(t.rwc, msg[:]); err != nil {
+		if _, err := io.ReadFull(t.rw, msg[:]); err != nil {
 			if err == io.EOF {
 				t.kick(fmt.Errorf("client kicked transport"))
 			} else {
@@ -463,7 +490,7 @@ func (t *transport) serve(ctx context.Context) {
 				t.kick(fmt.Errorf("payload too large (len=%d max=%d)", pkt.DataLength, len(buf)))
 				return
 			}
-			if _, err := io.ReadFull(t.rwc, buf[:pkt.DataLength]); err != nil {
+			if _, err := io.ReadFull(t.rw, buf[:pkt.DataLength]); err != nil {
 				if err == io.EOF {
 					t.kick(fmt.Errorf("client kicked transport"))
 				} else {
@@ -523,7 +550,18 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) error {
 		return nil
 
 	case aproto.A_STLS:
-		// TODO
+		if !t.server.UseTLS {
+			return nil // ignore stls packets (the actual adb impl doesn't, but that code path isn't used as the adb server needs to send the stls first)
+		}
+
+		if !t.doTLSHandshake(ctx) {
+			// only allow a single attempt
+			t.kick(fmt.Errorf("tls handshake failed"))
+			return nil
+		}
+
+		t.sendAuthConnect()
+		return nil
 
 	case aproto.A_AUTH:
 		if t.server.UseTLS {
@@ -626,6 +664,87 @@ func (t *transport) sendAuthPacket(command aproto.Command, arg0, arg1 uint32, da
 		pkt.DataCheck = aproto.Checksum(pkt.Payload)
 	}
 	t.authBuf = t.send(t.authBuf, pkt)
+}
+
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=513-557;drc=61197364367c9e404c7da6900658f1b16c42d0da
+func (t *transport) doTLSHandshake(ctx context.Context) bool {
+	// we need to block the connection entirely while doing the handshake (note:
+	// reading is already blocked since this is called from the packet handler)
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+
+	cert, err := generateX509Certificate(t.server.tlskey)
+	if err != nil {
+		t.kick(fmt.Errorf("failed to generate tls certificate: %w", err))
+		return false
+	}
+
+	parsedCert, err := x509.ParseCertificate(cert)
+	if err != nil {
+		t.kick(fmt.Errorf("failed to parse tls certificate: %w", err))
+		return false
+	}
+
+	debugStatus(t, "starting tls handshake")
+	var verified bool
+	tlsconn := tls.Server(t.conn, &tls.Config{
+		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return &tls.Certificate{
+				Certificate: [][]byte{cert},
+				PrivateKey:  t.server.tlskey,
+				Leaf:        parsedCert,
+			}, nil
+		},
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/daemon/auth.cpp;l=301-356;drc=61197364367c9e404c7da6900658f1b16c42d0da
+			for _, rawCert := range rawCerts {
+				ccert, err := x509.ParseCertificate(rawCert)
+				if err != nil {
+					debugStatus(t, "ignoring invalid client cert: %v", err)
+					continue
+				}
+				debugStatus(t, "got client cert (alg=%s sigalg=%s subject=%q)", ccert.PublicKeyAlgorithm, ccert.SignatureAlgorithm, ccert.Subject)
+				cpkey, ok := ccert.PublicKey.(*rsa.PublicKey)
+				if !ok {
+					debugStatus(t, "ignoring non-rsa %T client cert", ccert.PublicKey)
+					continue
+				}
+				if t.server.AllowedKeys == nil {
+					verified = true
+					return nil
+				}
+				for key := range t.server.AllowedKeys(ctx) {
+					if key.Equal(cpkey) {
+						verified = true
+						return nil
+					}
+				}
+				if t.server.PromptKey != nil {
+					t.server.PromptKey(ctx, "", cpkey)
+					for key := range t.server.AllowedKeys(ctx) {
+						if key.Equal(cpkey) {
+							verified = true
+							return nil
+						}
+					}
+				}
+				debugStatus(t, "ignoring unknown client adbkey")
+			}
+			return nil
+		},
+		ClientAuth: tls.RequestClientCert,
+	})
+	if err := tlsconn.HandshakeContext(ctx); err != nil {
+		debugStatus(t, "tls handshake error: %v", err)
+		return false
+	}
+	if !verified {
+		return false
+	}
+
+	debugStatus(t, "tls connection established")
+	t.rw = tlsconn
+	return true
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=351-405;drc=61197364367c9e404c7da6900658f1b16c42d0da
@@ -745,6 +864,31 @@ func makeDeviceBanner(ctx context.Context, srv adb.Dialer, transportFeatures ...
 		banner.WriteByte(';')
 	}
 	return banner.String(), nil
+}
+
+// TODO: move to aproto/acrypto.go?
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/crypto/x509_generator.cpp;l=34-122;drc=61197364367c9e404c7da6900658f1b16c42d0da
+func generateX509Certificate(pkey *rsa.PrivateKey) ([]byte, error) {
+	cert := &x509.Certificate{
+		Version: 2,
+
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Unix(0, 0),
+		NotAfter:     time.Now().Add(time.Second * time.Duration(10*365*24*60*60)),
+
+		Subject: pkix.Name{
+			Country:      []string{"US"},
+			Organization: []string{"Android"},
+			CommonName:   "Adb",
+		},
+
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+
+		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		SubjectKeyId: []byte("hash"),
+	}
+	return x509.CreateCertificate(crand.Reader, cert, cert, &pkey.PublicKey, pkey)
 }
 
 func stripTrailingNulls(b []byte) []byte {
