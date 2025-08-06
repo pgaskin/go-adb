@@ -116,7 +116,7 @@ type Server struct {
 	// ConnContext optionally specifies a function that modifies the context
 	// used for a new connection c. The provided ctx is derived from the base
 	// context and has a ServerContextKey value.
-	ConnContext func(ctx context.Context, c net.Conn) context.Context
+	ConnContext func(ctx context.Context, c net.Conn, t *Transport) context.Context
 
 	// OpenContext optionally specifies a function that modifies the context
 	// used for a new service connection c. The provided ctx is derived from the
@@ -147,7 +147,7 @@ type Server struct {
 
 	mu         sync.Mutex
 	listeners  map[*net.Listener]struct{}
-	transports map[*transport]struct{}
+	transports map[*Transport]struct{}
 }
 
 // LoadBanner generates the device banner. Only the first call will take effect;
@@ -242,16 +242,17 @@ func (s *Server) Serve(l net.Listener) error {
 			return err
 		}
 
+		t := s.newTransport(c)
+
 		cctx := lctx
 		if s.ConnContext != nil {
-			cctx = s.ConnContext(lctx, c)
+			cctx = s.ConnContext(lctx, c, t)
 			if cctx == nil {
 				panic("ConnContext returned nil")
 			}
 		}
 		delay = 0
 
-		t := s.newTransport(c)
 		go t.serve(cctx)
 	}
 }
@@ -351,11 +352,11 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 	return true
 }
 
-func (s *Server) trackTransport(c *transport, add bool) {
+func (s *Server) trackTransport(c *Transport, add bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.transports == nil {
-		s.transports = make(map[*transport]struct{})
+		s.transports = make(map[*Transport]struct{})
 	}
 	if add {
 		s.transports[c] = struct{}{}
@@ -364,7 +365,7 @@ func (s *Server) trackTransport(c *transport, add bool) {
 	}
 }
 
-type transport struct {
+type Transport struct {
 	tid    uint64
 	server *Server
 
@@ -403,8 +404,8 @@ type stream struct {
 	wqueue chan []byte
 }
 
-func (s *Server) newTransport(conn net.Conn) *transport {
-	t := &transport{
+func (s *Server) newTransport(conn net.Conn) *Transport {
+	t := &Transport{
 		tid:             s.tid.Add(1),
 		server:          s,
 		conn:            conn,
@@ -417,7 +418,32 @@ func (s *Server) newTransport(conn net.Conn) *transport {
 	return t
 }
 
-func (t *transport) close() error {
+// AuthInfo checks if the transport is authenticated, and returns the public key
+// used to authenticate, if known.
+func (t *Transport) AuthInfo() (*rsa.PublicKey, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.authkey, t.authenticated
+}
+
+// ForceAuth sends a CNXN packet immediately and marks the connection as
+// authenticated. Do not use this unless you know what you are doing and
+// understand the implications.
+func (t *Transport) ForceAuth() {
+	t.sendAuthConnect(nil)
+}
+
+// Kick disconnects the transport.
+func (t *Transport) Kick() {
+	t.kick(errors.New("server kicked transport"))
+}
+
+// NumStreams gets the number of streams open on the transport.
+func (t *Transport) NumStreams() int {
+	return t.numStreams()
+}
+
+func (t *Transport) close() error {
 	debugStatus(t, "close")
 	cerr := t.conn.Close()
 
@@ -438,13 +464,13 @@ func (t *transport) close() error {
 	return cerr
 }
 
-func (t *transport) kick(err error) {
+func (t *Transport) kick(err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.kickLocked(err)
 }
 
-func (t *transport) kickLocked(err error) {
+func (t *Transport) kickLocked(err error) {
 	if err != nil {
 		if t.err == nil {
 			debugStatus(t, "error: %v", err)
@@ -459,19 +485,19 @@ func (t *transport) kickLocked(err error) {
 	t.close()
 }
 
-func (t *transport) error() error {
+func (t *Transport) error() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.err
 }
 
-func (t *transport) numStreams() int {
+func (t *Transport) numStreams() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.streams)
 }
 
-func (t *transport) getToken(generate bool) []byte {
+func (t *Transport) getToken(generate bool) []byte {
 	if generate || t.token == nil {
 		token := make([]byte, aproto.AuthTokenSize)
 		if _, err := crand.Read(token); err != nil {
@@ -483,19 +509,19 @@ func (t *transport) getToken(generate bool) []byte {
 	return t.token
 }
 
-func (t *transport) isAuthenticated() bool {
+func (t *Transport) isAuthenticated() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.authenticated
 }
 
-func (t *transport) isKicked() bool {
+func (t *Transport) isKicked() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.kicked
 }
 
-func (t *transport) findLocalSocket(local, remote uint32) *stream {
+func (t *Transport) findLocalSocket(local, remote uint32) *stream {
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
 	for s := range t.streams {
@@ -506,7 +532,7 @@ func (t *transport) findLocalSocket(local, remote uint32) *stream {
 	return nil
 }
 
-func (t *transport) write(buf []byte) {
+func (t *Transport) write(buf []byte) {
 	t.sendMu.Lock()
 	defer t.sendMu.Unlock()
 	if _, err := t.rw.Write(buf); err != nil {
@@ -515,7 +541,7 @@ func (t *transport) write(buf []byte) {
 }
 
 // send sends pkt, reusing buf if possible.
-func (t *transport) send(buf []byte, pkt aproto.Packet) []byte {
+func (t *Transport) send(buf []byte, pkt aproto.Packet) []byte {
 	debugPacket(t, false, pkt)
 	if !t.isKicked() {
 		if len(pkt.Payload) > int(t.maxPayloadSize) {
@@ -532,7 +558,7 @@ func (t *transport) send(buf []byte, pkt aproto.Packet) []byte {
 	return buf
 }
 
-func (t *transport) serve(ctx context.Context) {
+func (t *Transport) serve(ctx context.Context) {
 	defer t.kick(nil)
 	var (
 		pkt aproto.Packet
@@ -591,7 +617,7 @@ func (t *transport) serve(ctx context.Context) {
 	}
 }
 
-func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
+func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 	switch pkt.Command {
 	case aproto.A_CNXN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=407-433;drc=61197364367c9e404c7da6900658f1b16c42d0da
 		func() {
@@ -940,11 +966,11 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 	debugStatus(t, "unhandled %s packet", pkt.Command)
 }
 
-func (t *transport) sendAuthRequest() {
+func (t *Transport) sendAuthRequest() {
 	t.authBuf = t.sendPacket(t.authBuf, aproto.A_AUTH, aproto.AuthToken, 0, t.getToken(true))
 }
 
-func (t *transport) sendAuthConnect(pubkey *rsa.PublicKey) {
+func (t *Transport) sendAuthConnect(pubkey *rsa.PublicKey) {
 	debugStatus(t, "authenticated")
 	func() {
 		t.mu.Lock()
@@ -958,7 +984,7 @@ func (t *transport) sendAuthConnect(pubkey *rsa.PublicKey) {
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=564-583;drc=61197364367c9e404c7da6900658f1b16c42d0da
 // https://android-review.googlesource.com/c/platform/system/core/+/568123
-func (t *transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 uint32, data []byte) []byte {
+func (t *Transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 uint32, data []byte) []byte {
 	pkt := aproto.Packet{
 		Message: aproto.Message{
 			Command:    command,
@@ -976,7 +1002,7 @@ func (t *transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 ui
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=513-557;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func (t *transport) doTLSHandshake(ctx context.Context) (*rsa.PublicKey, bool) {
+func (t *Transport) doTLSHandshake(ctx context.Context) (*rsa.PublicKey, bool) {
 	// we need to block the connection entirely while doing the handshake (note:
 	// reading is already blocked since this is called from the packet handler)
 	t.sendMu.Lock()
@@ -1235,13 +1261,13 @@ func (oc *onceCloseListener) close() {
 	oc.err = oc.Listener.Close()
 }
 
-func debugStatus(t *transport, format string, a ...any) {
+func debugStatus(t *Transport, format string, a ...any) {
 	if debug {
 		fmt.Printf("[%d] %s\n", t.tid, fmt.Sprintf(format, a...))
 	}
 }
 
-func debugPacket(t *transport, recv bool, pkt aproto.Packet) {
+func debugPacket(t *Transport, recv bool, pkt aproto.Packet) {
 	if debug {
 		c := '>'
 		if recv {
