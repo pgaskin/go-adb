@@ -34,3 +34,14 @@ func ParsePublicKey(buf []byte) (key *PublicKey, name string, err error) {
 	}
 	return key, name, err
 }
+
+// AppendPublicKey formats an ADB public key.
+func AppendPublicKey(b []byte, key *PublicKey, name string) []byte {
+	tmp, _ := key.AppendBinary(b) // will never error
+	b = base64.StdEncoding.AppendEncode(b, tmp)
+	if name != "" {
+		b = append(b, ' ')
+		b = append(b, name...)
+	}
+	return b
+}
