@@ -125,6 +125,13 @@ type Server struct {
 
 	// TODO: hooks for handling common per-connection we probably want to log
 
+	// AuthSignatureHook is called every time a signature is presented, along
+	// with the current value of the token. If it returns (result, true), the
+	// value of result overrides the authentication result. Note that for this
+	// to be called, AllowedKeys must be non-nil, even if it doesn't return any
+	// keys.
+	AuthSignatureHook func(ctx context.Context, token, sig []byte) (result, override bool)
+
 	deviceBannerOnce sync.Once
 	deviceBannerErr  error
 	deviceBanner     string
@@ -654,11 +661,21 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 
 		switch pkt.Arg0 {
 		case aproto.AuthSignature:
-			for key := range t.server.AllowedKeys(ctx) {
-				if err := rsa.VerifyPKCS1v15(key, crypto.SHA1, t.getToken(false), pkt.Payload); err != nil {
-					continue
+			token := t.getToken(false)
+
+			result, override := t.server.AuthSignatureHook(ctx, token, pkt.Payload)
+			if !override {
+				for key := range t.server.AllowedKeys(ctx) {
+					if err := rsa.VerifyPKCS1v15(key, crypto.SHA1, token, pkt.Payload); err != nil {
+						continue
+					}
+					debugStatus(t, "verified signature with pubkey n=%s e=%d", key.N, key.E)
+					t.failedAuthAttempts = 0
+					t.sendAuthConnect()
+					return
 				}
-				debugStatus(t, "verified signature with pubkey n=%s e=%d", key.N, key.E)
+			} else if result {
+				debugStatus(t, "verified signature with auth hook")
 				t.failedAuthAttempts = 0
 				t.sendAuthConnect()
 				return
