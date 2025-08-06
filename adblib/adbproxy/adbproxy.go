@@ -390,6 +390,7 @@ type transport struct {
 	kicked        bool
 	err           error
 	authenticated bool
+	authkey       *rsa.PublicKey
 }
 
 type stream struct {
@@ -626,7 +627,7 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			return
 		}
 
-		t.sendAuthConnect()
+		t.sendAuthConnect(nil)
 		return
 
 	case aproto.A_STLS:
@@ -634,13 +635,14 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 			return // ignore stls packets (the actual adb impl doesn't, but that code path isn't used as the adb server needs to send the stls first)
 		}
 
-		if !t.doTLSHandshake(ctx) {
+		authkey, ok := t.doTLSHandshake(ctx)
+		if !ok {
 			// only allow a single attempt
 			t.kick(fmt.Errorf("tls handshake failed"))
 			return
 		}
 
-		t.sendAuthConnect()
+		t.sendAuthConnect(authkey)
 		return
 
 	case aproto.A_AUTH:
@@ -671,13 +673,13 @@ func (t *transport) handle(ctx context.Context, pkt aproto.Packet) {
 					}
 					debugStatus(t, "verified signature with pubkey n=%s e=%d", key.N, key.E)
 					t.failedAuthAttempts = 0
-					t.sendAuthConnect()
+					t.sendAuthConnect(key)
 					return
 				}
 			} else if result {
 				debugStatus(t, "verified signature with auth hook")
 				t.failedAuthAttempts = 0
-				t.sendAuthConnect()
+				t.sendAuthConnect(nil)
 				return
 			}
 
@@ -942,12 +944,13 @@ func (t *transport) sendAuthRequest() {
 	t.authBuf = t.sendPacket(t.authBuf, aproto.A_AUTH, aproto.AuthToken, 0, t.getToken(true))
 }
 
-func (t *transport) sendAuthConnect() {
+func (t *transport) sendAuthConnect(pubkey *rsa.PublicKey) {
 	debugStatus(t, "authenticated")
 	func() {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		t.authenticated = true
+		t.authkey = pubkey
 	}()
 	t.authBuf = t.sendPacket(t.authBuf, aproto.A_CNXN, t.protocolVersion, t.maxPayloadSize, []byte(t.server.deviceBanner))
 	debugStatus(t, "sent banner")
@@ -973,7 +976,7 @@ func (t *transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 ui
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=513-557;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func (t *transport) doTLSHandshake(ctx context.Context) bool {
+func (t *transport) doTLSHandshake(ctx context.Context) (*rsa.PublicKey, bool) {
 	// we need to block the connection entirely while doing the handshake (note:
 	// reading is already blocked since this is called from the packet handler)
 	t.sendMu.Lock()
@@ -982,17 +985,20 @@ func (t *transport) doTLSHandshake(ctx context.Context) bool {
 	cert, err := generateX509Certificate(t.server.tlskey)
 	if err != nil {
 		t.kick(fmt.Errorf("failed to generate tls certificate: %w", err))
-		return false
+		return nil, false
 	}
 
 	parsedCert, err := x509.ParseCertificate(cert)
 	if err != nil {
 		t.kick(fmt.Errorf("failed to parse tls certificate: %w", err))
-		return false
+		return nil, false
 	}
 
 	debugStatus(t, "starting tls handshake")
-	var verified bool
+	var (
+		verified    bool
+		verifiedKey *rsa.PublicKey
+	)
 	tlsconn := tls.Server(t.conn, &tls.Config{
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return &tls.Certificate{
@@ -1029,6 +1035,7 @@ func (t *transport) doTLSHandshake(ctx context.Context) bool {
 					t.server.PromptKey(ctx, "", cpkey)
 					for key := range t.server.AllowedKeys(ctx) {
 						if key.Equal(cpkey) {
+							verifiedKey = key
 							verified = true
 							return nil
 						}
@@ -1042,15 +1049,15 @@ func (t *transport) doTLSHandshake(ctx context.Context) bool {
 	})
 	if err := tlsconn.HandshakeContext(ctx); err != nil {
 		debugStatus(t, "tls handshake error: %v", err)
-		return false
+		return nil, false
 	}
 	if !verified {
-		return false
+		return nil, false
 	}
 
 	debugStatus(t, "tls connection established")
 	t.rw = tlsconn
-	return true
+	return verifiedKey, true
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=351-405;drc=61197364367c9e404c7da6900658f1b16c42d0da
