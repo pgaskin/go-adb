@@ -64,7 +64,7 @@ type Conn struct {
 
 // New creates a new conn reading and writing to rw. It buffers its own input
 // and output.
-func New(rw io.ReadWriteCloser) *Conn {
+func New(rw io.ReadWriter) *Conn {
 	return &Conn{rw: rw}
 }
 
