@@ -1,12 +1,14 @@
 package aproto
 
 import (
+	"crypto/md5"
 	"crypto/rsa"
 	"encoding"
 	"encoding/binary"
 	"fmt"
 	"math/big"
 	"slices"
+	"strings"
 )
 
 // https://cs.android.com/android/platform/superproject/main/+/main:system/core/libcrypto_utils/android_pubkey.cpp;drc=61197364367c9e404c7da6900658f1b16c42d0da
@@ -118,4 +120,19 @@ func (k *PublicKey) AppendBinary(b []byte) ([]byte, error) {
 // MarshalBinary is like AppendBinary.
 func (k *PublicKey) MarshalBinary() ([]byte, error) {
 	return k.AppendBinary(nil)
+}
+
+// Fingerprint gets the MD5 fingerprint of the pubkey.
+func (k *PublicKey) Fingerprint() string {
+	var s strings.Builder
+	s.Grow(md5.Size*3 - 1)
+	b, _ := k.AppendBinary(nil)
+	for i, c := range md5.Sum(b) {
+		if i != 0 {
+			s.WriteByte(':')
+		}
+		s.WriteByte("0123456789ABCDEF"[(c>>4)&0xf])
+		s.WriteByte("0123456789ABCDEF"[c&0xf])
+	}
+	return s.String()
 }
