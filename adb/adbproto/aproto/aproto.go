@@ -311,6 +311,7 @@ func (c *Conn) Write(cmd Command, arg0, arg1 uint32, data []byte) bool {
 	} else {
 		for chunk := range slices.Chunk(data, int(c.MaxPayloadSize())) {
 			pkt.Payload = chunk
+			pkt.DataLength = uint32(len(pkt.Payload))
 			if c.ProtocolVersion() < VersionSkipChecksum {
 				pkt.DataCheck = Checksum(pkt.Payload)
 			}

@@ -7,6 +7,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"math/big"
 	"time"
 )
@@ -52,7 +53,12 @@ func AppendPublicKey(b []byte, key *PublicKey, name string) []byte {
 	return b
 }
 
-// GenerateCertificate generates a enw certificate for an ADB daemon.
+// GenerateKey generates a new private key for an ADB daemon.
+func GenerateKey(random io.Reader) (*rsa.PrivateKey, error) {
+	return rsa.GenerateKey(random, PublicKeyModulusSize*8)
+}
+
+// GenerateCertificate generates a new certificate for an ADB daemon.
 //
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/crypto/x509_generator.cpp;l=34-122;drc=61197364367c9e404c7da6900658f1b16c42d0da
 func GenerateCertificate(pkey *rsa.PrivateKey) ([]byte, error) {
