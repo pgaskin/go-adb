@@ -10,14 +10,12 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
-	"math/big"
 	"math/rand"
 	"net"
 	"os"
@@ -691,7 +689,10 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 		case aproto.AuthSignature:
 			token := t.getToken(false)
 
-			result, override := t.server.AuthSignatureHook(ctx, token, pkt.Payload)
+			var result, override bool
+			if t.server.AuthSignatureHook != nil {
+				result, override = t.server.AuthSignatureHook(ctx, token, pkt.Payload)
+			}
 			if !override {
 				for key := range t.server.AllowedKeys(ctx) {
 					if err := rsa.VerifyPKCS1v15(key, crypto.SHA1, token, pkt.Payload); err != nil {
@@ -748,9 +749,6 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 		}
 
 		svc := string(stripTrailingNulls(pkt.Payload))
-
-		// TODO: implement tracking of streams
-		// TODO: delayed ack
 
 		fn := func() {
 			sctx := ctx
@@ -1008,7 +1006,7 @@ func (t *Transport) doTLSHandshake(ctx context.Context) (*rsa.PublicKey, bool) {
 	t.sendMu.Lock()
 	defer t.sendMu.Unlock()
 
-	cert, err := generateX509Certificate(t.server.tlskey)
+	cert, err := aproto.GenerateCertificate(t.server.tlskey)
 	if err != nil {
 		t.kick(fmt.Errorf("failed to generate tls certificate: %w", err))
 		return nil, false
@@ -1203,31 +1201,6 @@ func makeDeviceBanner(ctx context.Context, srv adb.Dialer, transportFeatures ...
 		banner.WriteByte(';')
 	}
 	return banner.String(), nil
-}
-
-// TODO: move to aproto/acrypto.go?
-// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/crypto/x509_generator.cpp;l=34-122;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func generateX509Certificate(pkey *rsa.PrivateKey) ([]byte, error) {
-	cert := &x509.Certificate{
-		Version: 2,
-
-		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Unix(0, 0),
-		NotAfter:     time.Now().Add(time.Second * time.Duration(10*365*24*60*60)),
-
-		Subject: pkix.Name{
-			Country:      []string{"US"},
-			Organization: []string{"Android"},
-			CommonName:   "Adb",
-		},
-
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
-		SubjectKeyId: []byte("hash"),
-	}
-	return x509.CreateCertificate(crand.Reader, cert, cert, &pkey.PublicKey, pkey)
 }
 
 func (s *stream) notifyReady() {
