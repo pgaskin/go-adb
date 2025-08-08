@@ -11,7 +11,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -35,8 +34,7 @@ import (
 // TODO: refactor core server packet handling into adb/adbtcpip
 
 var (
-	debug, _        = strconv.ParseBool(os.Getenv("ADBPROXY_DEBUG"))
-	debugPayload, _ = strconv.ParseBool(os.Getenv("ADBPROXY_DEBUG_PAYLOAD"))
+	debug, _ = strconv.ParseBool(os.Getenv("ADBPROXY_DEBUG"))
 )
 
 var ErrServerClosed = errors.New("adbproxy: Server closed")
@@ -47,11 +45,6 @@ type contextKey struct {
 
 var (
 	ServerContextKey = &contextKey{"server"} // *Server
-)
-
-const (
-	protocolVersionMin = aproto.VersionMin
-	protocolVersionMax = aproto.VersionSkipChecksum
 )
 
 // Server serves an ADB TCP/IP server for an [adb.Dialer].
@@ -367,23 +360,20 @@ type Transport struct {
 	tid    uint64
 	server *Server
 
-	sendMu sync.Mutex
-	conn   net.Conn
-	rw     io.ReadWriter
+	sendMu  sync.Mutex
+	netconn net.Conn
+	conn    *aproto.Conn
 
 	streamsMu sync.Mutex
 	stream    uint32
 	streams   map[*stream]struct{}
 
 	// no mutex for these since only accessed from main serve goroutine
-	authBuf            []byte
 	failedAuthAttempts uint64
 
 	// no mutex for these since only modified from main serve goroutine while !authenticated
-	token           []byte
-	remoteFeatures  map[adbproto.Feature]struct{}
-	maxPayloadSize  uint32
-	protocolVersion uint32
+	token          []byte
+	remoteFeatures map[adbproto.Feature]struct{}
 
 	mu            sync.Mutex // this MUST not be held while waiting on I/O or external stuff
 	kicked        bool
@@ -404,12 +394,10 @@ type stream struct {
 
 func (s *Server) newTransport(conn net.Conn) *Transport {
 	t := &Transport{
-		tid:             s.tid.Add(1),
-		server:          s,
-		conn:            conn,
-		rw:              conn,
-		maxPayloadSize:  aproto.MaxPayloadSizeV1, // legacy v1 payload size until we know how much the remote can accept
-		protocolVersion: protocolVersionMin,      // min protocol version for maximum compatibility
+		tid:     s.tid.Add(1),
+		server:  s,
+		netconn: conn,
+		conn:    aproto.New(conn),
 	}
 	debugStatus(t, "new")
 	s.trackTransport(t, true)
@@ -443,7 +431,7 @@ func (t *Transport) NumStreams() int {
 
 func (t *Transport) close() error {
 	debugStatus(t, "close")
-	cerr := t.conn.Close()
+	cerr := t.netconn.Close()
 
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
@@ -530,78 +518,19 @@ func (t *Transport) findLocalSocket(local, remote uint32) *stream {
 	return nil
 }
 
-func (t *Transport) write(buf []byte) {
-	t.sendMu.Lock()
-	defer t.sendMu.Unlock()
-	if _, err := t.rw.Write(buf); err != nil {
-		t.kick(err)
-	}
-}
-
-// send sends pkt, reusing buf if possible.
-func (t *Transport) send(buf []byte, pkt aproto.Packet) []byte {
-	debugPacket(t, false, pkt)
-	if !t.isKicked() {
-		if len(pkt.Payload) > int(t.maxPayloadSize) {
-			t.kick(fmt.Errorf("%s packet is too long for remote", pkt.Command))
-			return buf
-		}
-		var err error
-		buf, err = pkt.AppendBinary(buf[:0])
-		if err != nil {
-			panic(err)
-		}
-		t.write(buf)
-	}
-	return buf
-}
-
 func (t *Transport) serve(ctx context.Context) {
-	defer t.kick(nil)
-	var (
-		pkt aproto.Packet
-		msg [aproto.MessageSize]byte
-		buf []byte
-	)
+	defer func() {
+		t.kick(t.conn.Error())
+	}()
 	for !t.isKicked() {
-		if n := int(t.maxPayloadSize); len(buf) != n {
-			buf = slices.Grow(buf[:0], n)[:n]
-		}
-		if _, err := io.ReadFull(t.rw, msg[:]); err != nil {
-			if err == io.EOF {
-				t.kick(fmt.Errorf("client kicked transport"))
-			} else {
-				t.kick(fmt.Errorf("read message: %w", err))
-			}
+		msg, payload, ok := t.conn.Read()
+		if !ok {
 			return
 		}
-		if err := pkt.Message.UnmarshalBinary(msg[:]); err != nil {
-			t.kick(fmt.Errorf("read message: %w", err))
-			return
+		pkt := aproto.Packet{
+			Message: msg,
+			Payload: payload,
 		}
-		if !pkt.Message.IsMagicValid() {
-			t.kick(fmt.Errorf("invalid magic (cmd=0x%08X magic=0x%08X)", pkt.Message.Command, pkt.Message.Magic))
-			return
-		}
-		if pkt.DataLength != 0 {
-			if pkt.DataLength > uint32(len(buf)) {
-				t.kick(fmt.Errorf("payload too large (len=%d max=%d)", pkt.DataLength, len(buf)))
-				return
-			}
-			if _, err := io.ReadFull(t.rw, buf[:pkt.DataLength]); err != nil {
-				if err == io.EOF {
-					t.kick(fmt.Errorf("client kicked transport"))
-				} else {
-					t.kick(fmt.Errorf("read payload: %w", err))
-				}
-				return
-			}
-		}
-		if pkt.Payload = buf[:pkt.DataLength]; !pkt.IsChecksumValid() {
-			t.kick(fmt.Errorf("invalid checksum (cmd=%s)", pkt.Command))
-			return
-		}
-		debugPacket(t, true, pkt)
 		var tt time.Time
 		if debug {
 			tt = time.Now()
@@ -625,24 +554,11 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 			t.failedAuthAttempts = 0
 		}()
 
-		_, _, features := parseBanner(string(pkt.Payload))
-
-		t.remoteFeatures = map[adbproto.Feature]struct{}{}
-		for _, f := range features {
-			t.remoteFeatures[f] = struct{}{}
-		}
-		if v := min(pkt.Arg0, protocolVersionMax); v != t.protocolVersion {
-			t.protocolVersion = v
-			debugStatus(t, "changed protocol version to 0x%08X", t.protocolVersion)
-		}
-		if v := min(pkt.Arg1, aproto.MaxPayloadSize); v != t.maxPayloadSize {
-			t.maxPayloadSize = v
-			debugStatus(t, "changed max payload size to %d", t.maxPayloadSize)
-		}
+		_, _, t.remoteFeatures = parseBanner(string(pkt.Payload))
 
 		if t.server.UseTLS {
 			// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=318-325;drc=61197364367c9e404c7da6900658f1b16c42d0da
-			t.authBuf = t.sendPacket(t.authBuf, aproto.A_STLS, aproto.STLSVersionMin, 0, nil)
+			t.sendPacket(aproto.A_STLS, aproto.STLSVersionMin, 0, nil)
 			return
 		}
 
@@ -659,8 +575,8 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 			return // ignore stls packets (the actual adb impl doesn't, but that code path isn't used as the adb server needs to send the stls first)
 		}
 
-		authkey, ok := t.doTLSHandshake(ctx)
-		if !ok {
+		authkey := t.doTLSHandshake(ctx)
+		if authkey == nil {
 			// only allow a single attempt
 			t.kick(fmt.Errorf("tls handshake failed"))
 			return
@@ -744,7 +660,7 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 		}
 		if pkt.Arg1 != uint32(t.server.DelayedAck) {
 			debugStatus(t, "unexpected OPEN delayed acks (exp=%d act=%d)", t.server.DelayedAck, pkt.Arg1)
-			t.authBuf = t.sendPacket(t.authBuf, aproto.A_CLSE, 0, pkt.Arg0, nil)
+			t.sendPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
 			return
 		}
 
@@ -763,7 +679,7 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 			conn, err := t.server.Dialer.DialADB(sctx, svc)
 			if err != nil {
 				debugStatus(t, "[%d] failed to open service %q: %v", pkt.Arg0, svc, err)
-				t.sendPacket(nil, aproto.A_CLSE, 0, pkt.Arg0, nil)
+				t.sendPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
 				return
 			}
 			debugStatus(t, "[%d] opened %q", pkt.Arg0, svc)
@@ -789,30 +705,29 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 			}()
 
 			if t.server.DelayedAck != 0 {
-				t.sendPacket(nil, aproto.A_OKAY, stream.local, stream.remote, binary.LittleEndian.AppendUint32(nil, uint32(t.server.DelayedAck)))
+				t.sendPacket(aproto.A_OKAY, stream.local, stream.remote, binary.LittleEndian.AppendUint32(nil, uint32(t.server.DelayedAck)))
 			} else {
-				t.sendPacket(nil, aproto.A_OKAY, stream.local, stream.remote, nil)
+				t.sendPacket(aproto.A_OKAY, stream.local, stream.remote, nil)
 			}
 
 			go func() {
-				buf := make([]byte, aproto.MessageSize+t.maxPayloadSize)
 				for data := range stream.wqueue {
 					if _, err := stream.device.Write(data); err != nil {
 						debugStatus(t, "[%d] failed to write to local device socket: %v", stream.local, err)
 						// TODO: is this the correct behaviour, or do we just ignore it?
 						stream.device.Close()
-						t.sendPacket(nil, aproto.A_CLSE, stream.local, stream.remote, nil)
+						t.sendPacket(aproto.A_CLSE, stream.local, stream.remote, nil)
 						// note: the client will send a CLSE back
 						return
 					}
 					// tell the remote we're ready for another WRTE
 					// TODO: do we need to care about delayed acks here?
-					buf = t.sendPacket(buf, aproto.A_OKAY, stream.local, stream.remote, nil)
+					t.sendPacket(aproto.A_OKAY, stream.local, stream.remote, nil)
 				}
 			}()
 
 			go func() {
-				buf := make([]byte, aproto.MessageSize+t.maxPayloadSize)
+				buf := make([]byte, aproto.MessageSize+t.conn.MaxPayloadSize())
 				for {
 					if t.server.DelayedAck == 0 || func() bool {
 						stream.mu.Lock()
@@ -842,29 +757,12 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 						debugStatus(t, "[%d] failed to read from local device socket: %v", stream.local, err)
 						// TODO: is this the correct behaviour, or do we just ignore it?
 						stream.device.Close()
-						t.sendPacket(nil, aproto.A_CLSE, stream.local, stream.remote, nil)
+						t.sendPacket(aproto.A_CLSE, stream.local, stream.remote, nil)
 						// note: the client will send a CLSE back
 						return
 					}
 					if n > 0 {
-						msg := aproto.Message{
-							Command:    aproto.A_WRTE,
-							Arg0:       stream.local,
-							Arg1:       stream.remote,
-							DataLength: uint32(n),
-							Magic:      uint32(aproto.A_WRTE) ^ 0xFFFFFFFF,
-						}
-						if t.protocolVersion < aproto.VersionSkipChecksum {
-							msg.DataCheck = aproto.Checksum(payload[:n])
-						}
-						if _, err := msg.AppendBinary(buf[:0]); err != nil {
-							panic(err)
-						}
-						debugPacket(t, false, aproto.Packet{
-							Message: msg,
-							Payload: payload[:n],
-						})
-						t.write(buf[:aproto.MessageSize+msg.DataLength])
+						t.sendPacket(aproto.A_WRTE, stream.local, stream.remote, payload[:n])
 						if t.server.DelayedAck != 0 {
 							func() {
 								stream.mu.Lock()
@@ -965,7 +863,7 @@ func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
 }
 
 func (t *Transport) sendAuthRequest() {
-	t.authBuf = t.sendPacket(t.authBuf, aproto.A_AUTH, aproto.AuthToken, 0, t.getToken(true))
+	t.sendPacket(aproto.A_AUTH, aproto.AuthToken, 0, t.getToken(true))
 }
 
 func (t *Transport) sendAuthConnect(pubkey *rsa.PublicKey) {
@@ -976,118 +874,82 @@ func (t *Transport) sendAuthConnect(pubkey *rsa.PublicKey) {
 		t.authenticated = true
 		t.authkey = pubkey
 	}()
-	t.authBuf = t.sendPacket(t.authBuf, aproto.A_CNXN, t.protocolVersion, t.maxPayloadSize, []byte(t.server.deviceBanner))
-	debugStatus(t, "sent banner")
+	t.sendPacket(aproto.A_CNXN, t.conn.ProtocolVersion(), t.conn.MaxPayloadSize(), []byte(t.server.deviceBanner))
+	debugStatus(t, "sent banner %q", t.server.deviceBanner)
 }
 
-// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=564-583;drc=61197364367c9e404c7da6900658f1b16c42d0da
-// https://android-review.googlesource.com/c/platform/system/core/+/568123
-func (t *Transport) sendPacket(buf []byte, command aproto.Command, arg0, arg1 uint32, data []byte) []byte {
-	pkt := aproto.Packet{
-		Message: aproto.Message{
-			Command:    command,
-			Arg0:       arg0,
-			Arg1:       arg1,
-			DataLength: uint32(len(data)),
-			Magic:      uint32(command) ^ 0xFFFFFFFF,
-		},
-		Payload: data,
-	}
-	if t.protocolVersion < aproto.VersionSkipChecksum {
-		pkt.DataCheck = aproto.Checksum(pkt.Payload)
-	}
-	return t.send(buf, pkt)
+func (t *Transport) sendPacket(command aproto.Command, arg0, arg1 uint32, data []byte) {
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+	t.conn.Write(command, arg0, arg1, data)
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=513-557;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func (t *Transport) doTLSHandshake(ctx context.Context) (*rsa.PublicKey, bool) {
-	// we need to block the connection entirely while doing the handshake (note:
-	// reading is already blocked since this is called from the packet handler)
+func (t *Transport) doTLSHandshake(ctx context.Context) *rsa.PublicKey {
 	t.sendMu.Lock()
 	defer t.sendMu.Unlock()
 
 	cert, err := aproto.GenerateCertificate(t.server.tlskey)
 	if err != nil {
 		t.kick(fmt.Errorf("failed to generate tls certificate: %w", err))
-		return nil, false
+		return nil
 	}
 
 	parsedCert, err := x509.ParseCertificate(cert)
 	if err != nil {
 		t.kick(fmt.Errorf("failed to parse tls certificate: %w", err))
-		return nil, false
+		return nil
 	}
 
-	debugStatus(t, "starting tls handshake")
-	var (
-		verified    bool
-		verifiedKey *rsa.PublicKey
-	)
-	tlsconn := tls.Server(t.conn, &tls.Config{
-		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return &tls.Certificate{
-				Certificate: [][]byte{cert},
-				PrivateKey:  t.server.tlskey,
-				Leaf:        parsedCert,
-			}, nil
-		},
-		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/daemon/auth.cpp;l=301-356;drc=61197364367c9e404c7da6900658f1b16c42d0da
-			for _, rawCert := range rawCerts {
-				ccert, err := x509.ParseCertificate(rawCert)
-				if err != nil {
-					debugStatus(t, "ignoring invalid client cert: %v", err)
-					continue
-				}
-				debugStatus(t, "got client cert (alg=%s sigalg=%s subject=%q)", ccert.PublicKeyAlgorithm, ccert.SignatureAlgorithm, ccert.Subject)
-				cpkey, ok := ccert.PublicKey.(*rsa.PublicKey)
-				if !ok {
-					debugStatus(t, "ignoring non-rsa %T client cert", ccert.PublicKey)
-					continue
-				}
-				if t.server.AllowedKeys == nil {
-					verified = true
-					return nil
-				}
-				for key := range t.server.AllowedKeys(ctx) {
-					if key.Equal(cpkey) {
-						verified = true
-						return nil
-					}
-				}
-				if t.server.PromptKey != nil {
-					t.server.PromptKey(ctx, "", cpkey)
-					for key := range t.server.AllowedKeys(ctx) {
-						if key.Equal(cpkey) {
-							verifiedKey = key
-							verified = true
-							return nil
-						}
-					}
-				}
-				debugStatus(t, "ignoring unknown client adbkey")
+	var verifiedKey *rsa.PublicKey
+	if !t.conn.Handshake(&tls.Certificate{
+		Certificate: [][]byte{cert},
+		PrivateKey:  t.server.tlskey,
+		Leaf:        parsedCert,
+	}, func(ccert *x509.Certificate) {
+		if verifiedKey != nil {
+			return
+		}
+		debugStatus(t, "got client cert (alg=%s sigalg=%s subject=%q)", ccert.PublicKeyAlgorithm, ccert.SignatureAlgorithm, ccert.Subject)
+		cpkey, ok := ccert.PublicKey.(*rsa.PublicKey)
+		if !ok {
+			debugStatus(t, "ignoring non-rsa %T client cert", ccert.PublicKey)
+			return
+		}
+		if t.server.AllowedKeys == nil {
+			verifiedKey = cpkey
+			return
+		}
+		for key := range t.server.AllowedKeys(ctx) {
+			if key.Equal(cpkey) {
+				verifiedKey = cpkey
+				return
 			}
-			return nil
-		},
-		ClientAuth: tls.RequestClientCert,
-	})
-	if err := tlsconn.HandshakeContext(ctx); err != nil {
-		debugStatus(t, "tls handshake error: %v", err)
-		return nil, false
+		}
+		if t.server.PromptKey != nil {
+			t.server.PromptKey(ctx, "", cpkey)
+			for key := range t.server.AllowedKeys(ctx) {
+				if key.Equal(cpkey) {
+					verifiedKey = key
+					return
+				}
+			}
+		}
+		debugStatus(t, "ignoring unknown client adbkey")
+	}) {
+		return nil
 	}
-	if !verified {
-		return nil, false
+	if verifiedKey != nil {
+		debugStatus(t, "tls connection established")
 	}
-
-	debugStatus(t, "tls connection established")
-	t.rw = tlsconn
-	return verifiedKey, true
+	return verifiedKey
 }
 
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=351-405;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func parseBanner(banner string) (state string, props map[string]string, features []adbproto.Feature) {
+func parseBanner(banner string) (state string, props map[string]string, features map[adbproto.Feature]struct{}) {
 	state, banner, _ = strings.Cut(banner, "::")
 	props = map[string]string{}
+	features = map[adbproto.Feature]struct{}{}
 	for prop := range strings.SplitSeq(banner, ";") {
 		if prop == "" {
 			continue
@@ -1099,7 +961,7 @@ func parseBanner(banner string) (state string, props map[string]string, features
 		if k == "features" {
 			if v != "" {
 				for feat := range strings.SplitSeq(v, ",") {
-					features = append(features, adbproto.Feature(feat))
+					features[adbproto.Feature(feat)] = struct{}{}
 				}
 			}
 			continue
@@ -1237,21 +1099,5 @@ func (oc *onceCloseListener) close() {
 func debugStatus(t *Transport, format string, a ...any) {
 	if debug {
 		fmt.Printf("[%d] %s\n", t.tid, fmt.Sprintf(format, a...))
-	}
-}
-
-func debugPacket(t *Transport, recv bool, pkt aproto.Packet) {
-	if debug {
-		c := '>'
-		if recv {
-			c = '<'
-		}
-		pfx := fmt.Sprintf("[%d] %c", t.tid, c)
-		fmt.Printf("%s %s(%d, %d, %d)\n", pfx, pkt.Command, pkt.Arg0, pkt.Arg1, pkt.DataLength)
-		if debugPayload && pkt.DataLength != 0 {
-			for line := range strings.Lines(hex.Dump(pkt.Payload)) {
-				fmt.Printf("%*s   %s", len(pfx), "", line)
-			}
-		}
 	}
 }
