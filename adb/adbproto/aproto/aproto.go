@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -170,6 +172,112 @@ var ConnectionProps = []string{
 	"ro.product.name",
 	"ro.product.model",
 	"ro.product.device",
+}
+
+// Banner is the payload of an A_CNXN packet.
+//
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=351-405?q=parse_banner&ss=android%2Fplatform%2Fsuperproject%2Fmain:packages%2Fmodules%2Fadb%2F
+type Banner struct {
+	Type     string
+	Props    map[string]string
+	Features map[string]struct{}
+}
+
+// Valid checks whether b contains anything which makes it unparseable.
+func (b *Banner) Valid() error {
+	if strings.Contains(b.Type, ":") {
+		return fmt.Errorf("type %q contains separator", b.Type)
+	}
+	for k, v := range b.Props {
+		if k == "features" {
+			return fmt.Errorf("props should not contain features")
+		}
+		if strings.ContainsAny(k, ";:") {
+			return fmt.Errorf("prop key %q contains separator", b.Type)
+		}
+		if strings.ContainsAny(v, ";:") {
+			return fmt.Errorf("prop value %q contains separator", b.Type)
+		}
+		// even though it'll get skipped by parse_banner if the key/value
+		// contains an =, it doesn't affect other properties, so don't check for
+		// that
+	}
+	for f := range b.Features {
+		if strings.ContainsAny(string(f), ";:") {
+			return fmt.Errorf("feature %q contains separator", f)
+		}
+	}
+	return nil
+}
+
+// Clone returns a deep copy of the banner.
+func (b *Banner) Clone() *Banner {
+	if b == nil {
+		return nil
+	}
+	return &Banner{
+		Type:     b.Type,
+		Props:    maps.Clone(b.Props),
+		Features: maps.Clone(b.Features),
+	}
+}
+
+// Encode encodes a banner. If it is not Valid, it may not be parseable again.
+func (b *Banner) Encode() string {
+	var banner strings.Builder
+	banner.WriteString(b.Type)
+	banner.WriteString("::")
+	for i, k := range slices.Sorted(maps.Keys(b.Props)) {
+		if i != 0 {
+			banner.WriteByte(';')
+		}
+		v := b.Props[k]
+		banner.WriteString(k)
+		banner.WriteByte('=')
+		banner.WriteString(v)
+	}
+	if len(b.Props) != 0 {
+		banner.WriteByte(';')
+	}
+	banner.WriteString("features=")
+	for i, f := range slices.Sorted(maps.Keys(b.Features)) {
+		if i != 0 {
+			banner.WriteByte(',')
+		}
+		banner.WriteString(string(f))
+	}
+	if legacyCompat := true; legacyCompat {
+		// the property list used to be ;-terminated rather than ;-separated,
+		// and newer adb versions will ignore empty items
+		banner.WriteByte(';')
+	}
+	return banner.String()
+}
+
+// Decode parses a banner. It is slightly more lenient than ADB.
+func (b *Banner) Decode(banner string) {
+	b.Type, banner, _ = strings.Cut(banner, ":")
+	_, banner, _ = strings.Cut(banner, ":")
+	b.Props = map[string]string{}
+	b.Features = map[string]struct{}{}
+	for prop := range strings.SplitSeq(banner, ";") {
+		if prop == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(prop, "=")
+		if !ok {
+			continue
+		}
+		if k == "features" {
+			if v != "" {
+				for feat := range strings.SplitSeq(v, ",") {
+					b.Features[feat] = struct{}{}
+				}
+			}
+			continue
+		}
+		b.Props[k] = v
+	}
 }
 
 // Conn is a low-level aproto connection. It does not handle connection state,
