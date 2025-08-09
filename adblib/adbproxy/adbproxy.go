@@ -1,12 +1,10 @@
-// Package adbproxy implements a ADB TCP/IP server for an existing ADB
-// connection.
+// Package adbproxy implements ADB-over-TCP/IP for an existing ADB server.
 package adbproxy
 
 import (
 	"cmp"
 	"context"
-	"crypto"
-	crand "crypto/rand"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,7 +13,8 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"math/rand"
+	"log/slog"
+	mrand "math/rand/v2"
 	"net"
 	"os"
 	"slices"
@@ -30,24 +29,50 @@ import (
 	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 )
 
-// TODO: refactor asocket logic (as a wrapper around readwriteclosers) into adb/aproto since we'll probably use it for client conns too
-// TODO: refactor core server packet handling into adb/adbtcpip
+// TODO: rewrite and optimize stream logic
+// TODO: implement DialADB
+// TODO: finish implementing and testing delayed ack
 
-var (
-	debug, _ = strconv.ParseBool(os.Getenv("ADBPROXY_DEBUG"))
-)
+var debug *slog.Logger
 
-var ErrServerClosed = errors.New("adbproxy: Server closed")
-
-type contextKey struct {
-	name string
+func init() {
+	if v, _ := strconv.ParseBool(os.Getenv("ADBPROXY_TRACE")); v {
+		debug = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		}))
+	} else {
+		debug = slog.New(slog.DiscardHandler)
+	}
 }
 
-var (
-	ServerContextKey = &contextKey{"server"} // *Server
+// Trace enables debug logging to the specified logger.
+func Trace(logger *slog.Logger) {
+	debug = logger
+}
+
+var ErrServerClosed = errors.New("server closed")
+
+type (
+	serverContextKey    struct{}
+	transportContextKey struct{}
 )
 
-// Server serves an ADB TCP/IP server for an [adb.Dialer].
+// ContextServer gets the Server ctx originated from.
+func ContextServer(ctx context.Context) *Server {
+	if v := ctx.Value(serverContextKey{}); v != nil {
+		return v.(*Server)
+	}
+	return nil
+}
+
+// ContextTransport gets the Transport ctx originated from.
+func ContextTransport(ctx context.Context) *Transport {
+	if v := ctx.Value(transportContextKey{}); v != nil {
+		return v.(*Transport)
+	}
+	return nil
+}
+
 type Server struct {
 	// Addr is the TCP address to listen on.
 	Addr string
@@ -56,108 +81,172 @@ type Server struct {
 	// known features will be exposed.
 	Dialer adb.Dialer
 
-	// If true, the listener will use TLS for connections (i.e., ADB-over-WiFi).
-	// If false, the connection will not be encrypted (i.e., legacy
-	// ADB-over-TCP/IP).
-	UseTLS bool
+	// Banner is the banner to use. Unsupported features will be filtered out
+	// before it is sent. If nil, [DeviceBanner] is called with the provided
+	// Dialer at startup.
+	Banner *aproto.Banner
 
-	// If not nil and UseTLS is false, this will be called when a new key is
-	// presented by the client. This function must be safe to be called
-	// concurrently, but will block individual transports.
+	// TLS enables TLS.
+	TLS bool
+
+	// TLSKey is the TLS private key to use for the server certificate. If
+	// nil, [aproto.GenerateKey] is called at startup.
+	TLSKey *rsa.PrivateKey
+
+	// TLSFallback, if true, uses a hacky method of detecting if the client
+	// supports TLS, and if not, falls back to legacy auth.
 	//
-	// For TLS connections, the key should be sent beforehand using the pairing
-	// protocol, but for flexibility, if AllowedKeys is not nil, this will be
-	// called if the presented key is not in AllowedKeys, then AllowedKeys will
-	// be checked again afterwards.
-	PromptKey func(ctx context.Context, name string, key *rsa.PublicKey)
+	// This is non-standard behaviour.
+	TLSFallback bool
 
-	// If not nil, this will be called to get the allowed public keys. If nil,
-	// all keys are allowed. This function must be safe to be called
-	// concurrently.
-	AllowedKeys func(ctx context.Context) iter.Seq[*rsa.PublicKey]
+	// NoAuthRetry disables retries for failed A_AUTH token authentication by
+	// not requesting a retry after the first round of signatures have been
+	// retried.
+	//
+	// This is non-standard behaviour.
+	NoAuthRetry bool
 
-	// If true, the listener will wait for adb services to finish dialing before
-	// continuing to process packets. This makes it match the official
-	// implementation, but has a significant performance and reliability
-	// penalty, especially when re-exposing a remote ADB server.
-	StrictOpenOrdering bool
+	// RetryAuthWithFirstSignature immediately retries authentication with the
+	// first signature presented by the client after receiving the public key
+	// instead of waiting for the next round of retries.
+	//
+	// It is intended to be combined with NoAuthRetry for cases where the list
+	// of allowed adbkeys is static. Note that the client will display an
+	// "failed to authenticate" message, then succeed anyways.
+	//
+	// This is non-standard behaviour.
+	RetryAuthWithFirstSignature bool
+
+	// If true, the listener will not wait for adb services to finish dialing
+	// before continuing to process packets. This improves performance and
+	// reliability when re-exposing a remote ADB server.
+	//
+	// This is non-standard behaviour.
+	LazyOpen bool
 
 	// If nonzero, delayed ack will be supported with the specified size. This
 	// must also be supported by the Dialer (if backed by adbd, ADB_BURST_MODE
 	// must be set).
 	DelayedAck int
 
-	// TODO: handle reverse stuff? might want to snoop forward: and killforward:
-	// services and block them by default as we don't have a good way to open a
-	// proxied port on the underlying adb server... it's probably better to do
-	// this as a wrapper around the dialer instead of in Server directly to keep
-	// things clean... but then we'll need to expose something to send an open
-	// to a connected transport (add a helper to this package which takes a
-	// context passed down from a *transport and allows doing a DialADB on the
-	// client?)... probably need to look at it more closely to ensure I
-	// understand it correctly
-
 	// BaseContext optionally specifies a function that returns the base context
 	// for incoming requests on this server. The provided Listener is the
 	// specific Listener that's about to start accepting requests. If
 	// BaseContext is nil, the default is context.Background(). If non-nil, it
-	// must return a non-nil context.
+	// must return a non-nil context. The context can be used with
+	// [ContextServer].
 	BaseContext func(net.Listener) context.Context
 
 	// ConnContext optionally specifies a function that modifies the context
 	// used for a new connection c. The provided ctx is derived from the base
-	// context and has a ServerContextKey value.
-	ConnContext func(ctx context.Context, c net.Conn, t *Transport) context.Context
+	// context. The context can be used with [ContextServer] and
+	// [ContextTransport].
+	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
 	// OpenContext optionally specifies a function that modifies the context
 	// used for a new service connection c. The provided ctx is derived from the
-	// connection context.
+	// connection context. The context can be used with [ContextServer] and
+	// [ContextTransport].
 	OpenContext func(ctx context.Context, svc string) context.Context
 
-	// TODO: hooks for handling common per-connection we probably want to log
+	// Auth gets an authenticator for authenticating clients. Each transport get
+	// its own one, with ctx being the connection context. Since the auth
+	// function is called while blocking the main loop, it may include sleeps
+	// for throttling (note: the official adb server currently throttles for one
+	// second for each failed auth after 256). If nil, authentication is not
+	// required.
+	Auth func(ctx context.Context) Authenticator
 
-	// AuthSignatureHook is called every time a signature is presented, along
-	// with the current value of the token. If it returns (result, true), the
-	// value of result overrides the authentication result. Note that for this
-	// to be called, AllowedKeys must be non-nil, even if it doesn't return any
-	// keys.
-	AuthSignatureHook func(ctx context.Context, token, sig []byte) (result, override bool)
+	bannerOnce sync.Once
+	bannerErr  error
+	banner     string
 
-	deviceBannerOnce sync.Once
-	deviceBannerErr  error
-	deviceBanner     string
-
-	tlskeyOnce sync.Once
-	tlskeyErr  error
-	tlskey     *rsa.PrivateKey // so we don't waste time generating a new one on every connection
+	certOnce sync.Once
+	certErr  error
+	cert     *tls.Certificate
 
 	shuttingDown  atomic.Bool
 	listenerGroup sync.WaitGroup
-
-	tid atomic.Uint64
 
 	mu         sync.Mutex
 	listeners  map[*net.Listener]struct{}
 	transports map[*Transport]struct{}
 }
 
-// LoadBanner generates the device banner. Only the first call will take effect;
+// loadBanner generates the device banner. Only the first call will take effect;
 // other calls will wait and return the error from the first. It will be
 // automatically called by [Server.ListenAndServe] or [Server.Serve] with the
 // listener's context (see [Server.BaseContext]). To use a custom timeout or
 // check the error, it should be called directly before starting the server.
-func (s *Server) LoadBanner(ctx context.Context) error {
+func (s *Server) loadBanner(ctx context.Context) error {
 	if s.shuttingDown.Load() {
 		return ErrServerClosed
 	}
-	s.deviceBannerOnce.Do(sync.OnceFunc(func() {
-		var feat []adbproto.Feature
-		if s.DelayedAck != 0 {
-			feat = append(feat, adbproto.FeatureDelayedAck)
+	s.bannerOnce.Do(func() {
+		s.banner, s.bannerErr = func() (string, error) {
+			var err error
+			banner := s.Banner.Clone()
+			if banner == nil {
+				banner, err = DeviceBanner(ctx, s.Dialer)
+				if err != nil {
+					return "", err
+				}
+			}
+			for f := range banner.Features {
+				if !slices.Contains(protocolFeatures, adbproto.Feature(f)) {
+					delete(banner.Features, f)
+				}
+			}
+			if s.DelayedAck != 0 {
+				banner.Features[adbproto.FeatureDelayedAck] = struct{}{}
+			}
+			if err := banner.Valid(); err != nil {
+				debug.Warn("invalid banner, using anyways", "error", err, "banner", banner.Encode())
+			}
+			return banner.Encode(), nil
+		}()
+		if s.bannerErr == nil {
+			debug.Debug("generated banner", "banner", s.banner)
 		}
-		s.deviceBanner, s.deviceBannerErr = makeDeviceBanner(ctx, s.Dialer, feat...)
-	}))
-	return s.deviceBannerErr
+	})
+	return s.bannerErr
+}
+
+// loadCertificate generates the TLS certificate (and a private key if
+// necessary). Only the first call will take effect; other calls will wait and
+// return the error from the first. It will be automatically called by
+// [Server.ListenAndServe] or [Server.Serve] with the listener's context (see
+// [Server.BaseContext]).
+func (s *Server) loadCertificate() error {
+	if s.shuttingDown.Load() {
+		return ErrServerClosed
+	}
+	s.certOnce.Do(func() {
+		s.cert, s.certErr = func() (*tls.Certificate, error) {
+			var err error
+			key := s.TLSKey
+			if key == nil {
+				key, err = aproto.GenerateKey(rand.Reader)
+				if err != nil {
+					return nil, err
+				}
+			}
+			raw, err := aproto.GenerateCertificate(key)
+			if err != nil {
+				return nil, err
+			}
+			cert, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return nil, err
+			}
+			return &tls.Certificate{
+				Certificate: [][]byte{raw},
+				PrivateKey:  key,
+				Leaf:        cert,
+			}, nil
+		}()
+	})
+	return s.certErr
 }
 
 // note: Go already sets NODELAY on TCP sockets
@@ -196,25 +285,23 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 	defer s.trackListener(&l, false)
 
-	lctx := context.Background()
+	ctx := context.Background()
+
+	lctx := context.WithValue(ctx, serverContextKey{}, s)
 	if s.BaseContext != nil {
 		lctx = s.BaseContext(lorig)
 		if lctx == nil {
 			panic("BaseContext returned a nil context")
 		}
 	}
-	lctx = context.WithValue(lctx, ServerContextKey, s)
 
-	if err := s.LoadBanner(lctx); err != nil {
+	if err := s.loadBanner(lctx); err != nil {
 		return fmt.Errorf("load banner: %w", err)
 	}
 
-	if s.UseTLS {
-		s.tlskeyOnce.Do(func() {
-			s.tlskey, s.tlskeyErr = rsa.GenerateKey(crand.Reader, aproto.PublicKeyModulusSize*8)
-		})
-		if err := s.tlskeyErr; err != nil {
-			return fmt.Errorf("generate tls key: %w", err)
+	if s.TLS {
+		if err := s.loadCertificate(); err != nil {
+			return fmt.Errorf("generate tls certificate: %w", err)
 		}
 	}
 
@@ -235,16 +322,20 @@ func (s *Server) Serve(l net.Listener) error {
 
 		t := s.newTransport(c)
 
-		cctx := lctx
+		cctx := context.WithValue(lctx, transportContextKey{}, t)
 		if s.ConnContext != nil {
-			cctx = s.ConnContext(lctx, c, t)
+			cctx = s.ConnContext(lctx, c)
 			if cctx == nil {
 				panic("ConnContext returned nil")
 			}
 		}
 		delay = 0
 
-		go t.serve(cctx)
+		go func() {
+			s.trackTransport(t, true)
+			defer s.trackTransport(t, false)
+			t.serve(cctx)
+		}()
 	}
 }
 
@@ -265,11 +356,11 @@ func (s *Server) closeIdleConns() bool {
 	defer s.mu.Unlock()
 	var active bool
 	for t := range s.transports {
-		if t.numStreams() != 0 {
+		if !t.Idle() {
 			active = true
 			continue
 		}
-		t.close()
+		t.Kick(ErrServerClosed)
 		delete(s.transports, t)
 	}
 	return !active
@@ -285,7 +376,7 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for t := range s.transports {
-		t.close()
+		t.Kick(ErrServerClosed)
 		delete(s.transports, t)
 	}
 	return clerr
@@ -304,7 +395,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// see net/http.Server.Shutdown logic for why this is done
 	pollIntervalBase := time.Millisecond
 	nextPollInterval := func() time.Duration {
-		interval := pollIntervalBase + time.Duration(rand.Intn(int(pollIntervalBase/10)))
+		interval := pollIntervalBase + time.Duration(mrand.IntN(int(pollIntervalBase/10)))
 		pollIntervalBase = min(pollIntervalBase*2, shutdownPollIntervalMax)
 		return interval
 	}
@@ -357,154 +448,615 @@ func (s *Server) trackTransport(c *Transport, add bool) {
 }
 
 type Transport struct {
-	tid    uint64
-	server *Server
+	server *Server // only for getting config
 
-	sendMu  sync.Mutex
-	netconn net.Conn
-	conn    *aproto.Conn
+	writeMu sync.Mutex // must be held while writing (reading is single-threaded)
+	conn    net.Conn
+	aproto  *aproto.Conn
+
+	stateMu       sync.Mutex     // must be held while reading/writing (except for reading the chans) (should not be held during io)
+	banner        *aproto.Banner // never write to it; always swap it
+	connected     chan struct{}
+	authenticated chan struct{}
+
+	kickMu  sync.Mutex // must be held while reading/writing (except for reading the chan)
+	kickErr error
+	kicked  chan struct{}
 
 	streamsMu sync.Mutex
 	stream    uint32
 	streams   map[*stream]struct{}
 
-	// no mutex for these since only accessed from main serve goroutine
-	failedAuthAttempts uint64
-
-	// no mutex for these since only modified from main serve goroutine while !authenticated
-	token          []byte
-	remoteFeatures map[adbproto.Feature]struct{}
-
-	mu            sync.Mutex // this MUST not be held while waiting on I/O or external stuff
-	kicked        bool
-	err           error
-	authenticated bool
-	authkey       *rsa.PublicKey
-}
-
-type stream struct {
-	local  uint32
-	remote uint32
-	device net.Conn
-	ready  chan struct{}
-	mu     sync.Mutex
-	asb    int64 // available send bytes (can be negative)
-	wqueue chan []byte
+	// must only be used within the main loop
+	useTLS  bool
+	token   [aproto.AuthTokenSize]byte
+	sig     []byte // first auth signature
+	adbkey  []byte // presented adbkey during legacy auth (not necessairly the one used for auth) (note: we only need to keep one since adb only sends the primary adbkey, not vendorkeys)
+	adbkeyp *aproto.PublicKey
 }
 
 func (s *Server) newTransport(conn net.Conn) *Transport {
-	t := &Transport{
-		tid:     s.tid.Add(1),
-		server:  s,
-		netconn: conn,
-		conn:    aproto.New(conn),
+	return &Transport{
+		server:        s,
+		conn:          conn,
+		aproto:        aproto.New(conn),
+		connected:     make(chan struct{}),
+		authenticated: make(chan struct{}),
+		kicked:        make(chan struct{}),
 	}
-	debugStatus(t, "new")
-	s.trackTransport(t, true)
-	return t
 }
 
-// AuthInfo checks if the transport is authenticated, and returns the public key
-// used to authenticate, if known.
-func (t *Transport) AuthInfo() (*rsa.PublicKey, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.authkey, t.authenticated
+// LocalAddr returns the local network address.
+func (t *Transport) LocalAddr() net.Addr {
+	return t.conn.LocalAddr()
 }
 
-// ForceAuth sends a CNXN packet immediately and marks the connection as
-// authenticated. Do not use this unless you know what you are doing and
-// understand the implications.
-func (t *Transport) ForceAuth() {
-	t.sendAuthConnect(nil)
+// RemoteAddr returns the remote network address.
+func (t *Transport) RemoteAddr() net.Addr {
+	return t.conn.RemoteAddr()
 }
 
-// Kick disconnects the transport.
-func (t *Transport) Kick() {
-	t.kick(errors.New("server kicked transport"))
-}
-
-// NumStreams gets the number of streams open on the transport.
-func (t *Transport) NumStreams() int {
-	return t.numStreams()
-}
-
-func (t *Transport) close() error {
-	debugStatus(t, "close")
-	cerr := t.netconn.Close()
-
+// Idle returns true if the transport does not have any open streams.
+func (t *Transport) Idle() bool {
 	t.streamsMu.Lock()
-	defer t.streamsMu.Unlock()
-	var errs []error
-	for s := range t.streams {
-		// TODO: refactor?
-		if err := s.device.Close(); err != nil {
-			errs = append(errs, err)
-		}
-		delete(t.streams, s)
-	}
-
-	if serr := errors.Join(errs...); serr != nil {
-		cerr = errors.Join(cerr, fmt.Errorf("close stream device conns: %w", serr))
-	}
-	return cerr
+	n := len(t.streams)
+	t.stateMu.Unlock()
+	return n == 0
 }
 
-func (t *Transport) kick(err error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.kickLocked(err)
+// Connected returns a channel which gets closed once the peer connection is
+// negotiated.
+func (t *Transport) Connected() <-chan struct{} {
+	return t.connected
 }
 
-func (t *Transport) kickLocked(err error) {
-	if err != nil {
-		if t.err == nil {
-			debugStatus(t, "error: %v", err)
-			t.err = err
-		}
-	}
-	if !t.kicked {
-		debugStatus(t, "kick")
-	}
-	t.kicked = true
-	t.server.trackTransport(t, false)
-	t.close()
-}
-
-func (t *Transport) error() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.err
-}
-
-func (t *Transport) numStreams() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.streams)
-}
-
-func (t *Transport) getToken(generate bool) []byte {
-	if generate || t.token == nil {
-		token := make([]byte, aproto.AuthTokenSize)
-		if _, err := crand.Read(token); err != nil {
-			t.kickLocked(fmt.Errorf("failed to generate token: %w", err)) // this should never fail
-			return nil
-		}
-		t.token = token
-	}
-	return t.token
-}
-
-func (t *Transport) isAuthenticated() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// Authenticated returns a channel which gets closed once the peer has
+// authenticated successfully. An Authenticated channel is always already
+// Connected.
+func (t *Transport) Authenticated() <-chan struct{} {
 	return t.authenticated
 }
 
-func (t *Transport) isKicked() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// Kicked returns a channel which gets closed when the transport is kicked by
+// either side. The reason can be found by calling Error.
+func (t *Transport) Kicked() <-chan struct{} {
 	return t.kicked
+}
+
+// Error returns the reason why the transport was kicked, or nil otherwise.
+func (t *Transport) Error() error {
+	t.kickMu.Lock()
+	err := t.kickErr
+	t.kickMu.Unlock()
+	return err
+}
+
+// Kick kicks the transport with the specified error (or a generic one if nil)
+// if the transport has not been kicked yet. This closes the TCP connection.
+func (t *Transport) Kick(err error) {
+	t.kickMu.Lock()
+	if t.kickErr != nil {
+		t.kickMu.Unlock()
+		return
+	}
+	if err == nil {
+		err = errors.New("server kicked transport")
+	}
+	t.kickErr = err
+	close(t.kicked)
+	t.kickMu.Unlock()
+
+	t.conn.Close()
+}
+
+var (
+	_ adb.Dialer   = (*Transport)(nil)
+	_ adb.Features = (*Transport)(nil)
+)
+
+// DialADB connects to a service on the client.
+func (t *Transport) DialADB(ctx context.Context, svc string) (net.Conn, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-t.Kicked():
+		return nil, fmt.Errorf("kicked: %w", t.Error())
+	case <-t.Authenticated(): // authenticated implies connected
+	}
+	return nil, errors.ErrUnsupported // TODO
+}
+
+// SupportsFeature checks whether a feature is supported by the client.It
+// returns false for everything until Connected.
+func (t *Transport) SupportsFeature(f adbproto.Feature) bool {
+	t.stateMu.Lock()
+	var ok bool
+	if t.banner != nil {
+		_, ok = t.banner.Features[string(f)]
+	}
+	t.stateMu.Unlock()
+	return ok
+}
+
+// Features returns an iterator of all features supported by the client.
+func (t *Transport) Features() iter.Seq[adbproto.Feature] {
+	t.stateMu.Lock()
+	banner := t.banner
+	t.stateMu.Unlock()
+	return func(yield func(adbproto.Feature) bool) {
+		if banner != nil {
+			for f := range banner.Features {
+				if !yield(adbproto.Feature(f)) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// serve runs the main loop for the connection. It blocks until the transport
+// has been kicked.
+func (t *Transport) serve(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	debug := debug.With("remote", t.RemoteAddr().String())
+	defer func() { debug.Info("kick", "error", t.Error()) }()
+	debug.Info("accept")
+	defer func() { t.Kick(nil) }()
+	var authenticator Authenticator
+	if t.server.Auth != nil {
+		authenticator = t.server.Auth(ctx)
+	}
+	for {
+		msg, data, ok := t.aproto.Read()
+		if !ok {
+			return
+		}
+		switch msg.Command {
+		case aproto.A_CNXN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=407-433;drc=61197364367c9e404c7da6900658f1b16c42d0da
+			select {
+			case <-t.Connected():
+				// note: for generic transports, adb would reset the transport
+				// and auth again, but we don't need to support that for tcp,
+				// which makes things much simpler
+				goto ignore // already connected
+			default:
+			}
+
+			func() {
+				t.stateMu.Lock()
+				defer t.stateMu.Unlock()
+
+				banner := new(aproto.Banner)
+				banner.Decode(string(data))
+				t.banner = banner
+			}()
+
+			debug.Info("connect", "banner", string(data), "use_tls", t.useTLS)
+			close(t.connected)
+
+			t.useTLS = t.server.TLS
+
+			// HACK: disable tls unless a feature introduced since then is there
+			if t.useTLS && t.server.TLSFallback {
+				t.useTLS = false
+				for _, feat := range tlsFeatures {
+					if _, t.useTLS = t.banner.Features[string(feat)]; t.useTLS {
+						break
+					}
+				}
+				if !t.useTLS {
+					debug.Warn("disabling tls since client seems too old")
+				}
+			}
+
+			switch {
+			case t.useTLS:
+				// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=318-325;drc=61197364367c9e404c7da6900658f1b16c42d0da
+				if !t.write(aproto.A_STLS, aproto.STLSVersionMin, 0, nil) {
+					return
+				}
+			case authenticator == nil:
+				debug.Info("authenticated")
+				close(t.authenticated)
+
+				if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
+					return
+				}
+			default:
+				if _, err := rand.Read(t.token[:]); err != nil {
+					t.Kick(fmt.Errorf("auth: failed to generate token: %w", err))
+					return
+				}
+				if !t.write(aproto.A_AUTH, aproto.AuthToken, 0, t.token[:]) {
+					return
+				}
+			}
+
+		case aproto.A_AUTH: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=458-498;drc=61197364367c9e404c7da6900658f1b16c42d0da;bpv=1;bpt=1
+			select {
+			default:
+				goto ignore // not connected yet
+			case <-t.Authenticated():
+				goto ignore // already authenticated
+			case <-t.Connected():
+			}
+			if t.useTLS {
+				goto ignore // ignore all auth packets when using tls
+			}
+
+			// note: when the adb host daemon has vendor keys loaded, it will
+			// send initial A_AUTH packets for each of them, but if rejected, it
+			// will only send the public key for the primary adbkey rather than
+			// all vendor keys
+
+			switch msg.Arg0 {
+			case aproto.AuthSignature:
+				debug.Debug("got new signature")
+
+				if t.sig == nil {
+					t.sig = slices.Clone(data)
+				}
+				auth := &AuthSignature{
+					Token:     t.token,
+					Signature: slices.Clone(data),
+				}
+				if t.adbkeyp != nil {
+					if auth.verifyInternal(t.adbkeyp) {
+						auth.AdbKey = t.adbkey
+					}
+				}
+				if !authenticator.Auth(auth) {
+					// ask for another key
+					debug.Debug("auth rejected, asking for the next signature")
+					if !t.write(aproto.A_AUTH, aproto.AuthToken, 0, t.token[:]) {
+						return
+					}
+					continue
+				}
+
+				debug.Info("authenticated")
+				close(t.authenticated)
+
+				if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
+					return
+				}
+
+			case aproto.AuthRSAPublicKey:
+				raw := stripTrailingNulls(data)
+				key, name, err := aproto.ParsePublicKey(raw)
+				if err != nil {
+					debug.Warn("ignoring invalid pubkey", "err", err, "raw", string(raw))
+					continue
+				}
+
+				debug.Debug("got new pubkey", "fingerprint", key.Fingerprint(), "name", name)
+				t.adbkey = slices.Clone(raw)
+				t.adbkeyp = key
+
+				// HACK
+				if t.server.RetryAuthWithFirstSignature && t.sig != nil {
+					auth := &AuthSignature{
+						AdbKey:    t.adbkey,
+						Token:     t.token,
+						Signature: slices.Clone(t.sig),
+					}
+					if auth.verifyInternal(t.adbkeyp) {
+						if authenticator.Auth(auth) {
+							debug.Info("authenticated")
+							close(t.authenticated)
+
+							if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
+								return
+							}
+							continue
+						}
+					}
+				}
+
+				// HACK
+				if t.server.NoAuthRetry {
+					continue
+				}
+
+				debug.Debug("doing auth again")
+				if _, err := rand.Read(t.token[:]); err != nil {
+					t.Kick(fmt.Errorf("auth: failed to generate token: %w", err))
+					return
+				}
+				if !t.write(aproto.A_AUTH, aproto.AuthToken, 0, t.token[:]) {
+					return
+				}
+
+			default:
+				debug.Warn("unhandled packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
+			}
+
+		case aproto.A_STLS: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/daemon/auth.cpp;l=358-383;drc=61197364367c9e404c7da6900658f1b16c42d0da;bpv=1;bpt=1
+			select {
+			default:
+				goto ignore // not connected yet
+			case <-t.Authenticated():
+				goto ignore // already authenticated
+			case <-t.Connected():
+			}
+			if !t.useTLS {
+				goto ignore // ignore all stls packets when not using tls
+			}
+
+			debug.Info("stls")
+
+			if t.server.cert == nil {
+				panic("adbproxy: server cert is nil") // it should have been generated at startup
+			}
+
+			verified := authenticator == nil
+			if !t.handshake(t.server.cert, func(peerCert *x509.Certificate) {
+				auth := &AuthCertificate{
+					Raw: peerCert.Raw,
+				}
+				if pk, _ := auth.PublicKey(); pk != nil {
+					debug.Debug("got cert", "alg", peerCert.PublicKeyAlgorithm, "sigalg", peerCert.SignatureAlgorithm, "subject", peerCert.Subject, "fingerprint", pk.Fingerprint())
+				} else {
+					debug.Warn("got malformed cert", "alg", peerCert.PublicKeyAlgorithm, "sigalg", peerCert.SignatureAlgorithm, "subject", peerCert.Subject)
+				}
+				if !verified && authenticator != nil {
+					verified = authenticator.Auth(auth)
+				}
+			}) {
+				return
+			}
+			if !verified {
+				t.Kick(errors.New("tls authentication failed")) // can't try again
+				return
+			}
+
+			debug.Info("authenticated")
+			close(t.authenticated)
+
+			if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
+				return
+			}
+
+		case aproto.A_SYNC: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/protocol.md;l=191-207;drc=593dc053eb97047637ff813081d9c2de55e17a46
+			goto ignore // never valid
+
+		case aproto.A_OPEN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=500-552;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
+			select {
+			default:
+				goto ignore // not connected yet
+			case <-t.Connected():
+			}
+			if msg.Arg0 == 0 {
+				goto ignore
+			}
+
+			if msg.Arg1 != uint32(t.server.DelayedAck) {
+				debug.Warn("unexpected OPEN delayed acks", "exp", t.server.DelayedAck, "act", msg.Arg1)
+				t.write(aproto.A_CLSE, 0, msg.Arg0, nil)
+				continue
+			}
+
+			debug := debug.With("id", msg.Arg0)
+
+			svc := string(stripTrailingNulls(data))
+
+			fn := func() {
+				sctx := ctx
+				if t.server.OpenContext != nil {
+					sctx = t.server.OpenContext(sctx, svc)
+					if sctx == nil {
+						panic("OpenContext returned nil")
+					}
+				}
+
+				debug.Debug("dialing", "svc", svc)
+				conn, err := t.server.Dialer.DialADB(sctx, svc)
+				if err != nil {
+					debug.Debug("failed to open service", "err", err)
+					t.write(aproto.A_CLSE, 0, msg.Arg0, nil)
+					return
+				}
+				debug.Debug("opened service")
+
+				// TODO: refactor into t.newStream
+				stream := func() *stream {
+					t.streamsMu.Lock()
+					defer t.streamsMu.Unlock()
+					if t.streams == nil {
+						t.streams = make(map[*stream]struct{})
+					}
+					t.stream++
+					stream := &stream{
+						local:  t.stream,
+						remote: msg.Arg0,
+						device: conn,
+						asb:    int64(t.server.DelayedAck),
+						ready:  make(chan struct{}, 1),
+						wqueue: make(chan []byte, 1),
+					}
+					t.streams[stream] = struct{}{}
+					return stream
+				}()
+
+				if t.server.DelayedAck != 0 {
+					t.write(aproto.A_OKAY, stream.local, stream.remote, binary.LittleEndian.AppendUint32(nil, uint32(t.server.DelayedAck)))
+				} else {
+					t.write(aproto.A_OKAY, stream.local, stream.remote, nil)
+				}
+
+				go func() {
+					for data := range stream.wqueue {
+						if _, err := stream.device.Write(data); err != nil {
+							debug.Debug("failed to write to local device socket", "err", err)
+							stream.device.Close()
+							t.write(aproto.A_CLSE, stream.local, stream.remote, nil)
+							// note: the client will send a CLSE back
+							return
+						}
+						// tell the remote we're ready for another WRTE
+						// TODO: do we need to care about delayed acks here?
+						t.write(aproto.A_OKAY, stream.local, stream.remote, nil)
+					}
+				}()
+
+				go func() {
+					buf := make([]byte, aproto.MessageSize+t.aproto.MaxPayloadSize())
+					for {
+						if t.server.DelayedAck == 0 || func() bool {
+							stream.mu.Lock()
+							defer stream.mu.Unlock()
+							return stream.asb <= 0
+						}() {
+							<-stream.ready
+						}
+
+						payload := buf[aproto.MessageSize:]
+						if t.server.DelayedAck != 0 {
+							asb := func() int64 {
+								stream.mu.Lock()
+								defer stream.mu.Unlock()
+								return stream.asb
+							}()
+							if asb == 0 {
+								continue
+							}
+							if int64(len(payload)) > asb {
+								payload = payload[:asb]
+							}
+						}
+
+						n, err := stream.device.Read(payload)
+						if err != nil {
+							if err != io.EOF {
+								debug.Debug("failed to read from local device socket", "err", err)
+							}
+							stream.device.Close()
+							t.write(aproto.A_CLSE, stream.local, stream.remote, nil)
+							// note: the client will send a CLSE back
+							return
+						}
+						if n > 0 {
+							t.write(aproto.A_WRTE, stream.local, stream.remote, payload[:n])
+							if t.server.DelayedAck != 0 {
+								func() {
+									stream.mu.Lock()
+									defer stream.mu.Unlock()
+									stream.asb -= int64(n)
+								}()
+							}
+						}
+					}
+				}()
+				stream.notifyReady()
+			}
+			if t.server.LazyOpen {
+				go fn()
+			} else {
+				fn()
+			}
+
+		case aproto.A_OKAY: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=554-592;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
+			select {
+			default:
+				goto ignore // not connected yet
+			case <-t.Authenticated():
+			}
+			if msg.Arg0 == 0 || msg.Arg1 == 0 {
+				goto ignore
+			}
+
+			var acked int32
+			if len(data) != 0 {
+				if len(data) != 4 {
+					debug.Warn("invalid OKAY payload size", "n", len(data))
+					continue
+				}
+				acked = int32(binary.LittleEndian.Uint32(data))
+			}
+
+			stream := t.findLocalSocket(msg.Arg1, 0)
+			if stream == nil {
+				// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
+				break
+			}
+
+			func() {
+				stream.mu.Lock()
+				defer stream.mu.Unlock()
+				if t.server.DelayedAck != 0 {
+					stream.asb += int64(acked)
+					if stream.asb > 0 {
+						stream.notifyReady()
+					}
+				} else {
+					stream.notifyReady()
+				}
+			}()
+
+		case aproto.A_CLSE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=594-616;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
+			select {
+			default:
+				goto ignore // not connected yet
+			case <-t.Authenticated():
+			}
+			if msg.Arg1 == 0 {
+				goto ignore
+			}
+
+			stream := t.findLocalSocket(msg.Arg1, msg.Arg0)
+			if stream == nil {
+				debug.Debug("cannot find stream to close, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
+				goto ignore
+			}
+
+			stream.device.Close()
+			stream.notifyReady()
+			func() {
+				t.streamsMu.Lock()
+				defer t.streamsMu.Unlock()
+				delete(t.streams, stream)
+			}()
+
+		case aproto.A_WRTE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=618-625;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
+			select {
+			default:
+				goto ignore // not connected yet
+			case <-t.Authenticated():
+			}
+			if msg.Arg0 == 0 || msg.Arg1 == 0 {
+				return
+			}
+
+			stream := t.findLocalSocket(msg.Arg1, msg.Arg0)
+			if stream == nil {
+				debug.Debug("cannot find stream to write, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
+				goto ignore
+			}
+
+			stream.wqueue <- slices.Clone(data) // TODO: optimize this, refactor
+
+		default:
+			debug.Warn("unhandled packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
+		}
+		continue
+	ignore:
+		debug.Warn("ignoring packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
+	}
+}
+
+// write locks writeMu and sends packets.
+func (t *Transport) write(cmd aproto.Command, arg0 uint32, arg1 uint32, data []byte) bool {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return t.aproto.Write(cmd, arg0, arg1, data)
+}
+
+// handshake locks writeMu and performs a TLS server handshake.
+func (t *Transport) handshake(serverCert *tls.Certificate, verify func(peerCert *x509.Certificate)) bool {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return t.aproto.Handshake(serverCert, verify)
 }
 
 func (t *Transport) findLocalSocket(local, remote uint32) *stream {
@@ -518,551 +1070,14 @@ func (t *Transport) findLocalSocket(local, remote uint32) *stream {
 	return nil
 }
 
-func (t *Transport) serve(ctx context.Context) {
-	defer func() {
-		t.kick(t.conn.Error())
-	}()
-	for !t.isKicked() {
-		msg, payload, ok := t.conn.Read()
-		if !ok {
-			return
-		}
-		pkt := aproto.Packet{
-			Message: msg,
-			Payload: payload,
-		}
-		var tt time.Time
-		if debug {
-			tt = time.Now()
-		}
-		t.handle(ctx, pkt)
-		if debug {
-			if td := time.Since(tt); td > time.Millisecond*250 {
-				debugStatus(t, "warning: slow handle (%s)", td)
-			}
-		}
-	}
-}
-
-func (t *Transport) handle(ctx context.Context, pkt aproto.Packet) {
-	switch pkt.Command {
-	case aproto.A_CNXN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=407-433;drc=61197364367c9e404c7da6900658f1b16c42d0da
-		func() {
-			t.mu.Lock()
-			defer t.mu.Unlock()
-			t.authenticated = false
-			t.failedAuthAttempts = 0
-		}()
-
-		_, _, t.remoteFeatures = parseBanner(string(pkt.Payload))
-
-		if t.server.UseTLS {
-			// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=318-325;drc=61197364367c9e404c7da6900658f1b16c42d0da
-			t.sendPacket(aproto.A_STLS, aproto.STLSVersionMin, 0, nil)
-			return
-		}
-
-		if t.server.AllowedKeys != nil {
-			t.sendAuthRequest()
-			return
-		}
-
-		t.sendAuthConnect(nil)
-		return
-
-	case aproto.A_STLS:
-		if !t.server.UseTLS {
-			return // ignore stls packets (the actual adb impl doesn't, but that code path isn't used as the adb server needs to send the stls first)
-		}
-
-		authkey := t.doTLSHandshake(ctx)
-		if authkey == nil {
-			// only allow a single attempt
-			t.kick(fmt.Errorf("tls handshake failed"))
-			return
-		}
-
-		t.sendAuthConnect(authkey)
-		return
-
-	case aproto.A_AUTH:
-		if t.server.UseTLS {
-			return // ignore auth packets
-		}
-		if t.server.AllowedKeys == nil {
-			return
-		}
-		if t.isAuthenticated() {
-			return
-		}
-
-		// note: when the adb host daemon has vendor keys loaded, it will send
-		// initial A_AUTH packets for each of them, but if rejected, it will
-		// only send the public key for the primary adbkey rather than all
-		// vendor keys
-
-		switch pkt.Arg0 {
-		case aproto.AuthSignature:
-			token := t.getToken(false)
-
-			var result, override bool
-			if t.server.AuthSignatureHook != nil {
-				result, override = t.server.AuthSignatureHook(ctx, token, pkt.Payload)
-			}
-			if !override {
-				for key := range t.server.AllowedKeys(ctx) {
-					if err := rsa.VerifyPKCS1v15(key, crypto.SHA1, token, pkt.Payload); err != nil {
-						continue
-					}
-					debugStatus(t, "verified signature with pubkey n=%s e=%d", key.N, key.E)
-					t.failedAuthAttempts = 0
-					t.sendAuthConnect(key)
-					return
-				}
-			} else if result {
-				debugStatus(t, "verified signature with auth hook")
-				t.failedAuthAttempts = 0
-				t.sendAuthConnect(nil)
-				return
-			}
-
-			if t.failedAuthAttempts++; t.failedAuthAttempts > 256 {
-				debugStatus(t, "reached failed auth limit, throttling")
-				time.Sleep(time.Second)
-			}
-
-			t.sendAuthRequest()
-			return
-
-		case aproto.AuthRSAPublicKey:
-			if t.server.PromptKey != nil {
-				buf := stripTrailingNulls(pkt.Payload)
-				key, name, err := aproto.ParsePublicKey(buf)
-				if err != nil {
-					debugStatus(t, "ignoring invalid pubkey %q: %v", string(buf), err)
-					return
-				}
-				t.server.PromptKey(ctx, name, aproto.GoPublicKey(key))
-			}
-			return
-		}
-
-	case aproto.A_SYNC: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/protocol.md;l=191-207;drc=593dc053eb97047637ff813081d9c2de55e17a46
-		debugStatus(t, "ignoring invalid SYNC packet (this is never valid on the wire)")
-		return
-
-	case aproto.A_OPEN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=500-552;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
-		if !t.isAuthenticated() {
-			return
-		}
-		if pkt.Arg0 == 0 {
-			return
-		}
-		if pkt.Arg1 != uint32(t.server.DelayedAck) {
-			debugStatus(t, "unexpected OPEN delayed acks (exp=%d act=%d)", t.server.DelayedAck, pkt.Arg1)
-			t.sendPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
-			return
-		}
-
-		svc := string(stripTrailingNulls(pkt.Payload))
-
-		fn := func() {
-			sctx := ctx
-			if t.server.OpenContext != nil {
-				sctx = t.server.OpenContext(sctx, svc)
-				if sctx == nil {
-					panic("OpenContext returned nil")
-				}
-			}
-
-			debugStatus(t, "[%d] dialing %q", pkt.Arg0, svc)
-			conn, err := t.server.Dialer.DialADB(sctx, svc)
-			if err != nil {
-				debugStatus(t, "[%d] failed to open service %q: %v", pkt.Arg0, svc, err)
-				t.sendPacket(aproto.A_CLSE, 0, pkt.Arg0, nil)
-				return
-			}
-			debugStatus(t, "[%d] opened %q", pkt.Arg0, svc)
-
-			// TODO: refactor into t.newStream
-			stream := func() *stream {
-				t.streamsMu.Lock()
-				defer t.streamsMu.Unlock()
-				if t.streams == nil {
-					t.streams = make(map[*stream]struct{})
-				}
-				t.stream++
-				stream := &stream{
-					local:  t.stream,
-					remote: pkt.Arg0,
-					device: conn,
-					asb:    int64(t.server.DelayedAck),
-					ready:  make(chan struct{}, 1),
-					wqueue: make(chan []byte, 1),
-				}
-				t.streams[stream] = struct{}{}
-				return stream
-			}()
-
-			if t.server.DelayedAck != 0 {
-				t.sendPacket(aproto.A_OKAY, stream.local, stream.remote, binary.LittleEndian.AppendUint32(nil, uint32(t.server.DelayedAck)))
-			} else {
-				t.sendPacket(aproto.A_OKAY, stream.local, stream.remote, nil)
-			}
-
-			go func() {
-				for data := range stream.wqueue {
-					if _, err := stream.device.Write(data); err != nil {
-						debugStatus(t, "[%d] failed to write to local device socket: %v", stream.local, err)
-						// TODO: is this the correct behaviour, or do we just ignore it?
-						stream.device.Close()
-						t.sendPacket(aproto.A_CLSE, stream.local, stream.remote, nil)
-						// note: the client will send a CLSE back
-						return
-					}
-					// tell the remote we're ready for another WRTE
-					// TODO: do we need to care about delayed acks here?
-					t.sendPacket(aproto.A_OKAY, stream.local, stream.remote, nil)
-				}
-			}()
-
-			go func() {
-				buf := make([]byte, aproto.MessageSize+t.conn.MaxPayloadSize())
-				for {
-					if t.server.DelayedAck == 0 || func() bool {
-						stream.mu.Lock()
-						defer stream.mu.Unlock()
-						return stream.asb <= 0
-					}() {
-						<-stream.ready
-					}
-
-					payload := buf[aproto.MessageSize:]
-					if t.server.DelayedAck != 0 {
-						asb := func() int64 {
-							stream.mu.Lock()
-							defer stream.mu.Unlock()
-							return stream.asb
-						}()
-						if asb == 0 {
-							continue
-						}
-						if int64(len(payload)) > asb {
-							payload = payload[:asb]
-						}
-					}
-
-					n, err := stream.device.Read(payload)
-					if err != nil {
-						debugStatus(t, "[%d] failed to read from local device socket: %v", stream.local, err)
-						// TODO: is this the correct behaviour, or do we just ignore it?
-						stream.device.Close()
-						t.sendPacket(aproto.A_CLSE, stream.local, stream.remote, nil)
-						// note: the client will send a CLSE back
-						return
-					}
-					if n > 0 {
-						t.sendPacket(aproto.A_WRTE, stream.local, stream.remote, payload[:n])
-						if t.server.DelayedAck != 0 {
-							func() {
-								stream.mu.Lock()
-								defer stream.mu.Unlock()
-								stream.asb -= int64(n)
-							}()
-						}
-					}
-				}
-			}()
-			stream.notifyReady()
-		}
-		if t.server.StrictOpenOrdering {
-			fn()
-		} else {
-			go fn()
-		}
-		return
-
-	case aproto.A_OKAY: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=554-592;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
-		if !t.isAuthenticated() {
-			return
-		}
-		if pkt.Arg0 == 0 || pkt.Arg1 == 0 {
-			return
-		}
-
-		var acked int32
-		if len(pkt.Payload) != 0 {
-			if len(pkt.Payload) != 4 {
-				debugStatus(t, "invalid OKAY payload size (%d)", len(pkt.Payload))
-				return
-			}
-			acked = int32(binary.LittleEndian.Uint32(pkt.Payload))
-		}
-
-		stream := t.findLocalSocket(pkt.Arg1, 0)
-		if stream == nil {
-			// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
-			break
-		}
-
-		func() {
-			stream.mu.Lock()
-			defer stream.mu.Unlock()
-			if t.server.DelayedAck != 0 {
-				stream.asb += int64(acked)
-				if stream.asb > 0 {
-					stream.notifyReady()
-				}
-			} else {
-				stream.notifyReady()
-			}
-		}()
-		return
-
-	case aproto.A_CLSE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=594-616;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
-		if !t.isAuthenticated() {
-			return
-		}
-		if pkt.Arg1 == 0 {
-			return
-		}
-
-		stream := t.findLocalSocket(pkt.Arg1, pkt.Arg0)
-		if stream == nil {
-			debugStatus(t, "cannot find stream to close, ignoring (remote=%d local=%d)", pkt.Arg0, pkt.Arg1)
-			return
-		}
-
-		stream.device.Close()
-		stream.notifyReady()
-		func() {
-			t.streamsMu.Lock()
-			defer t.streamsMu.Unlock()
-			delete(t.streams, stream)
-		}()
-		return
-
-	case aproto.A_WRTE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=618-625;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
-		if !t.isAuthenticated() {
-			return
-		}
-		if pkt.Arg0 == 0 || pkt.Arg1 == 0 {
-			return
-		}
-
-		stream := t.findLocalSocket(pkt.Arg1, pkt.Arg0)
-		if stream == nil {
-			debugStatus(t, "cannot find stream to write, ignoring (remote=%d local=%d)", pkt.Arg0, pkt.Arg1)
-			break
-		}
-
-		stream.wqueue <- slices.Clone(pkt.Payload) // TODO: optimize this, refactor
-		return
-	}
-	debugStatus(t, "unhandled %s packet", pkt.Command)
-}
-
-func (t *Transport) sendAuthRequest() {
-	t.sendPacket(aproto.A_AUTH, aproto.AuthToken, 0, t.getToken(true))
-}
-
-func (t *Transport) sendAuthConnect(pubkey *rsa.PublicKey) {
-	debugStatus(t, "authenticated")
-	func() {
-		t.mu.Lock()
-		defer t.mu.Unlock()
-		t.authenticated = true
-		t.authkey = pubkey
-	}()
-	t.sendPacket(aproto.A_CNXN, t.conn.ProtocolVersion(), t.conn.MaxPayloadSize(), []byte(t.server.deviceBanner))
-	debugStatus(t, "sent banner %q", t.server.deviceBanner)
-}
-
-func (t *Transport) sendPacket(command aproto.Command, arg0, arg1 uint32, data []byte) {
-	t.sendMu.Lock()
-	defer t.sendMu.Unlock()
-	t.conn.Write(command, arg0, arg1, data)
-}
-
-// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/transport.cpp;l=513-557;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func (t *Transport) doTLSHandshake(ctx context.Context) *rsa.PublicKey {
-	t.sendMu.Lock()
-	defer t.sendMu.Unlock()
-
-	cert, err := aproto.GenerateCertificate(t.server.tlskey)
-	if err != nil {
-		t.kick(fmt.Errorf("failed to generate tls certificate: %w", err))
-		return nil
-	}
-
-	parsedCert, err := x509.ParseCertificate(cert)
-	if err != nil {
-		t.kick(fmt.Errorf("failed to parse tls certificate: %w", err))
-		return nil
-	}
-
-	var verifiedKey *rsa.PublicKey
-	if !t.conn.Handshake(&tls.Certificate{
-		Certificate: [][]byte{cert},
-		PrivateKey:  t.server.tlskey,
-		Leaf:        parsedCert,
-	}, func(ccert *x509.Certificate) {
-		if verifiedKey != nil {
-			return
-		}
-		debugStatus(t, "got client cert (alg=%s sigalg=%s subject=%q)", ccert.PublicKeyAlgorithm, ccert.SignatureAlgorithm, ccert.Subject)
-		cpkey, ok := ccert.PublicKey.(*rsa.PublicKey)
-		if !ok {
-			debugStatus(t, "ignoring non-rsa %T client cert", ccert.PublicKey)
-			return
-		}
-		if t.server.AllowedKeys == nil {
-			verifiedKey = cpkey
-			return
-		}
-		for key := range t.server.AllowedKeys(ctx) {
-			if key.Equal(cpkey) {
-				verifiedKey = cpkey
-				return
-			}
-		}
-		if t.server.PromptKey != nil {
-			t.server.PromptKey(ctx, "", cpkey)
-			for key := range t.server.AllowedKeys(ctx) {
-				if key.Equal(cpkey) {
-					verifiedKey = key
-					return
-				}
-			}
-		}
-		debugStatus(t, "ignoring unknown client adbkey")
-	}) {
-		return nil
-	}
-	if verifiedKey != nil {
-		debugStatus(t, "tls connection established")
-	}
-	return verifiedKey
-}
-
-// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=351-405;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func parseBanner(banner string) (state string, props map[string]string, features map[adbproto.Feature]struct{}) {
-	state, banner, _ = strings.Cut(banner, "::")
-	props = map[string]string{}
-	features = map[adbproto.Feature]struct{}{}
-	for prop := range strings.SplitSeq(banner, ";") {
-		if prop == "" {
-			continue
-		}
-		k, v, ok := strings.Cut(prop, "=")
-		if !ok {
-			continue
-		}
-		if k == "features" {
-			if v != "" {
-				for feat := range strings.SplitSeq(v, ",") {
-					features[adbproto.Feature(feat)] = struct{}{}
-				}
-			}
-			continue
-		}
-		props[k] = v
-	}
-	return
-}
-
-// makeDeviceBanner creates the device banner for the specified adb server. If srv
-// implements [adb.Features], known protocol-level features will be added from
-// it. Features which require transport support must be manually specified.
-//
-// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=294-316;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func makeDeviceBanner(ctx context.Context, srv adb.Dialer, transportFeatures ...adbproto.Feature) (string, error) {
-	const typ = "device"
-
-	var protocolFeatures = []adbproto.Feature{
-		// note: features should be added here when added to adbproto
-		adbproto.FeatureShell2,
-		adbproto.FeatureCmd,
-		adbproto.FeatureStat2,
-		adbproto.FeatureLs2,
-		adbproto.FeatureLibusb,
-		adbproto.FeaturePushSync,
-		adbproto.FeatureApex,
-		adbproto.FeatureFixedPushMkdir,
-		adbproto.FeatureAbb,
-		adbproto.FeatureFixedPushSymlinkTimestamp,
-		adbproto.FeatureAbbExec,
-		adbproto.FeatureRemountShell,
-		adbproto.FeatureTrackApp,
-		adbproto.FeatureSendRecv2,
-		adbproto.FeatureSendRecv2Brotli,
-		adbproto.FeatureSendRecv2LZ4,
-		adbproto.FeatureSendRecv2Zstd,
-		adbproto.FeatureSendRecv2DryRunSend,
-		// needs transport support: adbproto.FeatureDelayedAck,
-		adbproto.FeatureOpenscreenMdns,
-		adbproto.FeatureDeviceTrackerProtoFormat,
-		adbproto.FeatureDevRaw,
-		adbproto.FeatureAppInfo,
-		adbproto.FeatureServerStatus,
-	}
-
-	var features []adbproto.Feature
-	for _, f := range protocolFeatures {
-		if adb.SupportsFeature(srv, f) == nil {
-			features = append(features, f)
-		}
-	}
-	for _, f := range transportFeatures {
-		if adb.SupportsFeature(srv, f) == nil && !slices.Contains(features, f) {
-			features = append(features, f)
-		}
-	}
-
-	var cmd strings.Builder
-	cmd.WriteString("echo -n ")
-	for i, prop := range aproto.ConnectionProps {
-		if i != 0 {
-			cmd.WriteString(`\;`)
-		}
-		cmd.WriteString("'")
-		cmd.WriteString(prop)
-		cmd.WriteString("'=`getprop ")
-		cmd.WriteString(prop)
-		cmd.WriteString("`")
-	}
-
-	c, err := adb.Exec(ctx, srv, cmd.String())
-	if err != nil {
-		return "", fmt.Errorf("get props: %w", err)
-	}
-	defer c.Close()
-
-	props, err := io.ReadAll(c)
-	if err != nil {
-		panic(err)
-	}
-
-	var banner strings.Builder
-	banner.WriteString(typ)
-	banner.WriteString("::")
-	banner.Write(props)
-	if len(props) != 0 {
-		banner.WriteByte(';')
-	}
-	banner.WriteString("features=")
-	for i, f := range features {
-		if i != 0 {
-			banner.WriteByte(',')
-		}
-		banner.WriteString(string(f))
-	}
-	if legacyCompat := true; legacyCompat {
-		// the property list used to be ;-terminated rather than ;-separated,
-		// and newer adb versions will ignore empty items
-		banner.WriteByte(';')
-	}
-	return banner.String(), nil
+type stream struct {
+	local  uint32
+	remote uint32
+	device net.Conn
+	ready  chan struct{}
+	mu     sync.Mutex
+	asb    int64 // available send bytes (can be negative)
+	wqueue chan []byte
 }
 
 func (s *stream) notifyReady() {
@@ -1074,11 +1089,102 @@ func (s *stream) notifyReady() {
 	}
 }
 
-func stripTrailingNulls(b []byte) []byte {
-	for len(b) > 0 && b[len(b)-1] == 0 {
-		b = b[:len(b)-1]
+// DeviceBanner creates a banner for the specified adb server. If srv implements
+// [adb.Features], known protocol-level features will be added from it.
+func DeviceBanner(ctx context.Context, srv adb.Dialer) (*aproto.Banner, error) {
+	const sep = "._-=-_."
+
+	var cmd strings.Builder
+	cmd.WriteString("echo ")
+	cmd.WriteString(sep)
+	for _, prop := range aproto.ConnectionProps {
+		cmd.WriteString(";getprop '")
+		cmd.WriteString(prop)
+		cmd.WriteString("';echo ")
+		cmd.WriteString(sep)
 	}
-	return b
+
+	c, err := adb.Exec(ctx, srv, cmd.String())
+	if err != nil {
+		return nil, fmt.Errorf("get props: %w", err)
+	}
+
+	props, err := io.ReadAll(c)
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close()
+
+	spl := strings.Split(string(props), sep)
+	if len(spl) != len(aproto.ConnectionProps)+2 {
+		return nil, fmt.Errorf("get props: invalid output (%q)", string(props))
+	}
+
+	b := &aproto.Banner{
+		Type:     "device",
+		Props:    map[string]string{},
+		Features: map[string]struct{}{},
+	}
+	for i, prop := range aproto.ConnectionProps {
+		b.Props[prop] = strings.TrimSpace(spl[i+1])
+	}
+	if srv, ok := srv.(adb.Features); ok {
+		for _, feat := range protocolFeatures {
+			if srv.SupportsFeature(feat) {
+				b.Features[string(feat)] = struct{}{}
+			}
+		}
+	}
+	return b, nil
+}
+
+// tlsFeatures contains features added since the "Add A_STLS command" commit
+// from oldest to newest.
+//
+//	git -C platform/packages/modules/adb log -pS 'const char* const kFeature' 64fab7573566c80fb3003a3b7ca9063e240e8db5..HEAD@{2025-08-08} -- transport.cpp | grep '^[+]const char[*] const kFeature' | cut -d '"' -f2 | tac
+var tlsFeatures = []adbproto.Feature{
+	"track_app",
+	"sendrecv_v2_brotli",
+	"sendrecv_v2",
+	"sendrecv_v2_lz4",
+	"sendrecv_v2_dry_run_send",
+	"sendrecv_v2_zstd",
+	"openscreen_mdns",
+	"delayed_ack",
+	"devicetracker_proto_format",
+	"devraw",
+	"app_info",
+	"server_status",
+}
+
+// protocolFeatures contains known protocol-level features.
+//
+// note: features should be added here when added to adbproto
+var protocolFeatures = []adbproto.Feature{
+	adbproto.FeatureShell2,
+	adbproto.FeatureCmd,
+	adbproto.FeatureStat2,
+	adbproto.FeatureLs2,
+	adbproto.FeatureLibusb,
+	adbproto.FeaturePushSync,
+	adbproto.FeatureApex,
+	adbproto.FeatureFixedPushMkdir,
+	adbproto.FeatureAbb,
+	adbproto.FeatureFixedPushSymlinkTimestamp,
+	adbproto.FeatureAbbExec,
+	adbproto.FeatureRemountShell,
+	adbproto.FeatureTrackApp,
+	adbproto.FeatureSendRecv2,
+	adbproto.FeatureSendRecv2Brotli,
+	adbproto.FeatureSendRecv2LZ4,
+	adbproto.FeatureSendRecv2Zstd,
+	adbproto.FeatureSendRecv2DryRunSend,
+	// needs transport support: adbproto.FeatureDelayedAck,
+	adbproto.FeatureOpenscreenMdns,
+	adbproto.FeatureDeviceTrackerProtoFormat,
+	adbproto.FeatureDevRaw,
+	adbproto.FeatureAppInfo,
+	adbproto.FeatureServerStatus,
 }
 
 type onceCloseListener struct {
@@ -1096,8 +1202,9 @@ func (oc *onceCloseListener) close() {
 	oc.err = oc.Listener.Close()
 }
 
-func debugStatus(t *Transport, format string, a ...any) {
-	if debug {
-		fmt.Printf("[%d] %s\n", t.tid, fmt.Sprintf(format, a...))
+func stripTrailingNulls(b []byte) []byte {
+	for len(b) > 0 && b[len(b)-1] == 0 {
+		b = b[:len(b)-1]
 	}
+	return b
 }
