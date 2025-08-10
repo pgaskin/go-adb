@@ -1126,7 +1126,14 @@ type localSocket struct {
 	mu sync.Mutex
 }
 
-var _ io.ReadCloser = (*localSocket)(nil)
+var (
+	_ io.ReadCloser = (*localSocket)(nil)
+	_ io.WriterTo   = (*localSocket)(nil)
+)
+
+func (r *localSocket) SetMaxPayload(n uint32) {
+
+}
 
 // Handle handles a packet. It does not keep references to the packet payload
 // after returning. It must not be called concurrently (if you are trying to,
@@ -1139,6 +1146,12 @@ func (r *localSocket) Handle(pkt aproto.Packet) {
 // Read reads data from the stream up to len(b), returning the number of bytes
 // read (n > 0). On EOF, it returns (0, io.EOF).
 func (r *localSocket) Read(b []byte) (int, error) {
+	panic("not implemented")
+}
+
+// WriteTo efficiently writes all data to w until EOF or error. On EOF, err is
+// nil.
+func (r *localSocket) WriteTo(w io.Writer) (int64, error) {
 	panic("not implemented")
 }
 
@@ -1192,7 +1205,10 @@ type remoteSocket struct {
 	mu sync.Mutex
 }
 
-var _ io.WriteCloser = (*remoteSocket)(nil)
+var (
+	_ io.WriteCloser = (*remoteSocket)(nil)
+	_ io.ReaderFrom  = (*remoteSocket)(nil)
+)
 
 // SetDelayedAck sets the "available send bytes" to n, allowing that many bytes
 // to be sent before waiting for them to be acked. If n is zero (the default),
@@ -1207,6 +1223,12 @@ func (w *remoteSocket) SetDelayedAck(n uint32) {
 // Write writes data to the stream. It returns the number of bytes written to
 // the stream. If err is nil, n == len(b).
 func (w *remoteSocket) Write(b []byte) (int, error) {
+	panic("not implemented")
+}
+
+// ReadFrom efficiently writes all data from r until EOF or error. On EOF, err
+// is nil.
+func (w *remoteSocket) ReadFrom(r io.Reader) (int64, error) {
 	panic("not implemented")
 }
 
@@ -1256,11 +1278,24 @@ func (w *remoteSocket) SetDeadline(t time.Time) {
 	w.deadline.Set(t)
 }
 
+type shutdownRD interface {
+	CloseRead() error
+}
+
+type shutdownWR interface {
+	CloseWrite() error
+}
+
+var (
+	_ shutdownRD = (*net.TCPConn)(nil)
+	_ shutdownWR = (*net.TCPConn)(nil)
+)
+
 // socketPair combines a LS and a RS into a [net.Conn]. It behaves similarly to
 // a [net.TCPConn].
 type socketPair struct {
-	ls *localSocket
-	rs *remoteSocket
+	LS *localSocket
+	RS *remoteSocket
 
 	// for force-closing the RS's LS (TODO: is this correct?)
 	closedMu sync.Mutex
@@ -1268,34 +1303,45 @@ type socketPair struct {
 	closeErr error
 }
 
-var _ net.Conn = (*socketPair)(nil)
-
-// newSocketPair wraps two half-sockets. It panics if the sockets don't
-// correspond to each other.
-func newSocketPair(ls *localSocket, rs *remoteSocket) *socketPair {
-	if ls.Local != rs.Remote || ls.Remote != rs.Local {
-		panic("socket pairs do not correspond")
-	}
-	return &socketPair{ls: ls, rs: rs}
-}
+var (
+	_ net.Conn      = (*socketPair)(nil)
+	_ io.ReaderFrom = (*socketPair)(nil)
+	_ io.WriterTo   = (*socketPair)(nil)
+	_ shutdownRD    = (*socketPair)(nil)
+	_ shutdownWR    = (*socketPair)(nil)
+)
 
 func (d *socketPair) Read(b []byte) (n int, err error) {
-	return d.ls.Read(b)
+	if d.LS.Local != d.RS.Remote || d.LS.Remote != d.RS.Local {
+		panic("socket pairs do not correspond")
+	}
+	return d.LS.Read(b)
+}
+
+func (d *socketPair) ReadFrom(r io.Reader) (int64, error) {
+	return d.RS.ReadFrom(r)
 }
 
 func (d *socketPair) Write(b []byte) (n int, err error) {
-	return d.rs.Write(b)
+	if d.LS.Local != d.RS.Remote || d.LS.Remote != d.RS.Local {
+		panic("socket pairs do not correspond")
+	}
+	return d.RS.Write(b)
+}
+
+func (d *socketPair) WriteTo(w io.Writer) (int64, error) {
+	return d.LS.WriteTo(w)
 }
 
 func (d *socketPair) CloseRead() error {
-	if err := d.ls.Close(); err != nil {
+	if err := d.LS.Close(); err != nil {
 		return fmt.Errorf("local: %w", err)
 	}
 	return nil
 }
 
 func (d *socketPair) CloseWrite() error {
-	if err := d.rs.Close(); err != nil {
+	if err := d.RS.Close(); err != nil {
 		return fmt.Errorf("remote: %w", err)
 	}
 	return nil
@@ -1309,7 +1355,7 @@ func (d *socketPair) Close() error {
 	d.closedMu.Lock()
 	defer d.closedMu.Unlock()
 	if !d.isClosed {
-		d.closeErr = d.rs.Send(aproto.A_CLSE, uint32(d.rs.Local), uint32(d.rs.Remote), nil)
+		d.closeErr = d.RS.Send(aproto.A_CLSE, uint32(d.RS.Local), uint32(d.RS.Remote), nil)
 	}
 	err3 := d.closeErr
 	if err3 != nil {
@@ -1319,27 +1365,71 @@ func (d *socketPair) Close() error {
 }
 
 func (d *socketPair) LocalAddr() net.Addr {
-	return d.ls.Local
+	return d.LS.Local
 }
 
 func (d *socketPair) RemoteAddr() net.Addr {
-	return d.rs.Local
+	return d.RS.Local
 }
 
 func (d *socketPair) SetDeadline(t time.Time) error {
-	d.ls.SetDeadline(t)
-	d.rs.SetDeadline(t)
+	d.LS.SetDeadline(t)
+	d.RS.SetDeadline(t)
 	return nil
 }
 
 func (d *socketPair) SetReadDeadline(t time.Time) error {
-	d.ls.SetDeadline(t)
+	d.LS.SetDeadline(t)
 	return nil
 }
 
 func (d *socketPair) SetWriteDeadline(t time.Time) error {
-	d.rs.SetDeadline(t)
+	d.RS.SetDeadline(t)
 	return nil
+}
+
+// localServiceSocket runs the loop connecting a local service socket to a
+// socket pair, then closes both sockets.
+func localServiceSocket(p *socketPair, lss net.Conn) error {
+	var (
+		readCh  = make(chan error, 1)
+		writeCh = make(chan error, 1)
+	)
+	go func() {
+		_, err := p.WriteTo(lss)
+		if err != nil {
+			err = fmt.Errorf("copy lss -> ls: %w", err)
+		}
+		p.CloseRead()
+		if c, ok := lss.(shutdownWR); ok {
+			c.CloseWrite()
+		}
+		readCh <- err
+	}()
+	go func() {
+		_, err := p.ReadFrom(lss)
+		if err != nil {
+			err = fmt.Errorf("copy rs -> lss", err)
+		}
+		p.CloseWrite()
+		if c, ok := lss.(shutdownRD); ok {
+			c.CloseRead()
+		}
+		writeCh <- err
+	}()
+	var (
+		readErr  = <-readCh
+		writeErr = <-writeCh
+	)
+	closeErr1 := p.Close()
+	if closeErr1 != nil {
+		closeErr1 = fmt.Errorf("close ls/rs: %w", closeErr1)
+	}
+	closeErr2 := lss.Close()
+	if closeErr2 != nil {
+		closeErr2 = fmt.Errorf("close lss: %w", closeErr2)
+	}
+	return errors.Join(readErr, writeErr, closeErr1, closeErr2)
 }
 
 // deadline implements stuff needed for deadlines on fake connection
