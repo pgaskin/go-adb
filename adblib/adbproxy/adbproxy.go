@@ -14,6 +14,7 @@ import (
 	"io"
 	"iter"
 	"log/slog"
+	"math"
 	mrand "math/rand/v2"
 	"net"
 	"os"
@@ -885,13 +886,17 @@ func (t *Transport) serve(ctx context.Context) {
 					t.write(aproto.A_OKAY, stream.local, stream.remote, nil)
 				}
 
+				// TODO: separate read and write socket pair halves (and the device is responsible for closing the one which writes to the client, then we close the other)
+
 				go func() {
 					for data := range stream.wqueue {
 						if _, err := stream.device.Write(data); err != nil {
 							debug.Debug("failed to write to local device socket", "err", err)
-							stream.device.Close()
+							// don't close the device here; there might be more
+							// to read from it
 							t.write(aproto.A_CLSE, stream.local, stream.remote, nil)
-							// note: the client will send a CLSE back
+							// note: the client will send a CLSE back when it
+							// wants to close its end
 							return
 						}
 						// tell the remote we're ready for another WRTE
@@ -1034,6 +1039,8 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
+			// if this blocks, it's because the client is misbehaving (sending
+			// more than we've ack'd)
 			stream.wqueue <- slices.Clone(data) // TODO: optimize this, refactor
 
 		default:
@@ -1087,6 +1094,307 @@ func (s *stream) notifyReady() {
 	default:
 		// already have a ready queued (chan buffer is 1)
 	}
+}
+
+type SocketAddr uint32
+
+var _ net.Addr = SocketAddr(0)
+
+func (a SocketAddr) Network() string {
+	return "adb"
+}
+
+func (a SocketAddr) String() string {
+	return strconv.FormatUint(uint64(a), 10)
+}
+
+// localSocket is a stream which reads from the aproto client (i.e., receives
+// A_WRTE/A_CLSE packets). It is safe for concurrent use.
+//
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
+type localSocket struct {
+	Local  SocketAddr
+	Remote SocketAddr
+
+	closedMu sync.Mutex
+	closedCh atomic.Value
+	isClosed bool
+
+	deadline deadline
+
+	mu sync.Mutex
+}
+
+var _ io.ReadCloser = (*localSocket)(nil)
+
+// Handle handles a packet. It does not keep references to the packet payload
+// after returning. It must not be called concurrently (if you are trying to,
+// you are doing something wrong since an aproto.Conn's Read can't be used
+// concurrently either).
+func (r *localSocket) Handle(pkt aproto.Packet) {
+	panic("not implemented")
+}
+
+// Read reads data from the stream up to len(b), returning the number of bytes
+// read (n > 0). On EOF, it returns (0, io.EOF).
+func (r *localSocket) Read(b []byte) (int, error) {
+	panic("not implemented")
+}
+
+// SetDeadline sets the deadline for future and pending Read calls. A zero value
+// for t means Read will not time out.
+func (r *localSocket) SetDeadline(t time.Time) {
+	r.deadline.Set(t)
+}
+
+// Close prevents future calls to Read and interrupts any pending ones, causing
+// them to return [net.ErrClosed]. It does not have any effect on the peer. It
+// wil never fail.
+//
+// It is simlar to a TCP shutdown(SHUT_RD).
+func (r *localSocket) Close() error {
+	r.closedMu.Lock()
+	defer r.closedMu.Unlock()
+	if r.isClosed {
+		return nil
+	}
+	c := r.closedCh.Load()
+	if c == nil {
+		c = make(chan struct{})
+		r.closedCh.Store(c)
+	}
+	close(c.(chan struct{}))
+	r.isClosed = true
+	return nil
+}
+
+// remoteSocket is a stream which writes to the aproto client (i.e., sends
+// A_WRTE/A_CLSE packets and receives A_OKAY onces). It is safe for concurrent
+// use.
+//
+// This is known as a "remote socket" in ADB.
+//
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
+// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
+type remoteSocket struct {
+	Local  SocketAddr
+	Remote SocketAddr
+	Send   func(cmd aproto.Command, arg0 uint32, arg1 uint32, data []byte) error // must be safe to be called concurrently
+
+	closedMu sync.Mutex
+	closedCh atomic.Value
+	isClosed bool
+	closeErr error
+
+	deadline deadline
+
+	mu sync.Mutex
+}
+
+var _ io.WriteCloser = (*remoteSocket)(nil)
+
+// SetDelayedAck sets the "available send bytes" to n, allowing that many bytes
+// to be sent before waiting for them to be acked. If n is zero (the default),
+// delayed acks are disabled. It will panic if called after the buffer has been
+// used.
+func (w *remoteSocket) SetDelayedAck(n uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	panic("not implemented")
+}
+
+// Write writes data to the stream. It returns the number of bytes written to
+// the stream. If err is nil, n == len(b).
+func (w *remoteSocket) Write(b []byte) (int, error) {
+	panic("not implemented")
+}
+
+// Close closes the stream. This preempts any writes which have not started yet
+// and causes them to return [net.ErrClosed]. It blocks until the A_CLOSE is
+// sent (it does not follow the write deadline). It causes the peer to detect an
+// EOF, after which the peer will send an A_CLSE back to close our local socket.
+//
+// It is simlar to a TCP shutdown(SHUT_WR).
+func (w *remoteSocket) Close() error {
+	w.closedMu.Lock()
+	defer w.closedMu.Unlock()
+	if w.isClosed {
+		return w.closeErr
+	}
+	c := w.closedCh.Load()
+	if c == nil {
+		c = make(chan struct{})
+		w.closedCh.Store(c)
+	}
+	close(c.(chan struct{}))
+	w.closeErr = w.Send(aproto.A_CLSE, uint32(w.Remote), uint32(w.Local), nil)
+	w.isClosed = true
+	return w.closeErr
+}
+
+// closed lazily initializes and returns w.closedCh.
+func (w *remoteSocket) closed() chan struct{} {
+	c := w.closedCh.Load()
+	if c != nil { // fast path
+		return c.(chan struct{})
+	}
+	w.closedMu.Lock()
+	defer w.closedMu.Unlock()
+	c = w.closedCh.Load()
+	if c == nil { // check again (we could have missed it before the mutex)
+		c = make(chan struct{})
+		w.closedCh.Store(c)
+	}
+	return c.(chan struct{})
+}
+
+// SetDeadline sets the deadline for future and pending Write calls. Even if
+// write times out, it may return n > 0, indicating that some of the data was
+// successfully written. A zero value for t means Write will not time out.
+func (w *remoteSocket) SetDeadline(t time.Time) {
+	w.deadline.Set(t)
+}
+
+// socketPair combines a LS and a RS into a [net.Conn]. It behaves similarly to
+// a [net.TCPConn].
+type socketPair struct {
+	ls *localSocket
+	rs *remoteSocket
+
+	// for force-closing the RS's LS (TODO: is this correct?)
+	closedMu sync.Mutex
+	isClosed bool
+	closeErr error
+}
+
+var _ net.Conn = (*socketPair)(nil)
+
+// newSocketPair wraps two half-sockets. It panics if the sockets don't
+// correspond to each other.
+func newSocketPair(ls *localSocket, rs *remoteSocket) *socketPair {
+	if ls.Local != rs.Remote || ls.Remote != rs.Local {
+		panic("socket pairs do not correspond")
+	}
+	return &socketPair{ls: ls, rs: rs}
+}
+
+func (d *socketPair) Read(b []byte) (n int, err error) {
+	return d.ls.Read(b)
+}
+
+func (d *socketPair) Write(b []byte) (n int, err error) {
+	return d.rs.Write(b)
+}
+
+func (d *socketPair) CloseRead() error {
+	if err := d.ls.Close(); err != nil {
+		return fmt.Errorf("local: %w", err)
+	}
+	return nil
+}
+
+func (d *socketPair) CloseWrite() error {
+	if err := d.rs.Close(); err != nil {
+		return fmt.Errorf("remote: %w", err)
+	}
+	return nil
+}
+
+// Close immediately closes both ends of the socket.
+func (d *socketPair) Close() error {
+	err1 := d.CloseRead()
+	err2 := d.CloseWrite()
+
+	d.closedMu.Lock()
+	defer d.closedMu.Unlock()
+	if !d.isClosed {
+		d.closeErr = d.rs.Send(aproto.A_CLSE, uint32(d.rs.Local), uint32(d.rs.Remote), nil)
+	}
+	err3 := d.closeErr
+	if err3 != nil {
+		err3 = fmt.Errorf("remote local: %w", err1)
+	}
+	return errors.Join(err1, err2, err3)
+}
+
+func (d *socketPair) LocalAddr() net.Addr {
+	return d.ls.Local
+}
+
+func (d *socketPair) RemoteAddr() net.Addr {
+	return d.rs.Local
+}
+
+func (d *socketPair) SetDeadline(t time.Time) error {
+	d.ls.SetDeadline(t)
+	d.rs.SetDeadline(t)
+	return nil
+}
+
+func (d *socketPair) SetReadDeadline(t time.Time) error {
+	d.ls.SetDeadline(t)
+	return nil
+}
+
+func (d *socketPair) SetWriteDeadline(t time.Time) error {
+	d.rs.SetDeadline(t)
+	return nil
+}
+
+// deadline implements stuff needed for deadlines on fake connection
+// implementations. It is safe for concurrent use.
+type deadline struct {
+	mu     sync.Mutex
+	timer  *time.Timer
+	notify atomic.Value
+}
+
+func (d *deadline) Done() <-chan struct{} {
+	if c := d.notify.Load(); c != nil { // fast path
+		return c.(chan struct{})
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c := d.notify.Load(); c != nil { // check again (we could have missed it before the mutex)
+		return c.(chan struct{})
+	}
+	return d.setLocked(-1) // initialize with an infinite deadline
+}
+
+func (d *deadline) Set(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.setLocked(max(0, time.Until(t)))
+}
+
+func (d *deadline) SetTimeout(t time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.setLocked(t)
+}
+
+// setLocked sets the deadline to t. If t is negative, there is no deadline. The
+// mutex must be held while calling this.
+func (d *deadline) setLocked(t time.Duration) <-chan struct{} {
+	c := d.notify.Load()
+	if d.timer == nil {
+		d.timer = time.NewTimer(math.MaxInt64)
+	}
+	if d.timer.Stop() || c == nil {
+		c = make(chan struct{})
+		d.notify.Store(c)
+		go func() {
+			<-d.timer.C
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			close(c.(chan struct{}))
+		}()
+	}
+	if t >= 0 {
+		d.timer.Reset(t)
+	}
+	return c.(chan struct{})
 }
 
 // DeviceBanner creates a banner for the specified adb server. If srv implements
