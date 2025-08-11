@@ -472,6 +472,8 @@ func (c *Conn) Handshake(serverCert *tls.Certificate, verify func(peerCert *x509
 	return true
 }
 
+// TODO: client handshake
+
 // Error gets the error, if any. It can safely be called concurrently.
 func (c *Conn) Error() error {
 	c.errm.Lock()

@@ -1,4 +1,4 @@
-package adbproxy
+package aproto
 
 import (
 	"cmp"
@@ -13,11 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 )
 
-// TODO: move this to adb/adbproto/aproto
 // TODO: actually test delayed acks
 
 // SocketAddr is an ADB socket address, unique on the end it was created on. A
@@ -50,9 +47,9 @@ type LocalSocket struct {
 	Local  SocketAddr
 	Remote SocketAddr
 
-	MaxPayload uint32                                                                // required
-	DelayedAck uint32                                                                // required, zero if delayed ack disabled
-	Send       func(cmd aproto.Command, arg0 uint32, arg1 uint32, data []byte) error // must be safe to be called concurrently
+	MaxPayload uint32                                                         // required
+	DelayedAck uint32                                                         // required, zero if delayed ack disabled
+	Send       func(cmd Command, arg0 uint32, arg1 uint32, data []byte) error // must be safe to be called concurrently
 
 	deadline deadline
 	closer   closer
@@ -81,11 +78,11 @@ func (r *LocalSocket) initLocked() {
 
 // Handle handles a packet. It does not keep references to the packet payload
 // after returning. It must not be called concurrently (if you are trying to,
-// you are doing something wrong since an aproto.Conn's Read can't be used
-// concurrently either). It will block if it receives more A_WRTE packets than
-// allowed given the A_OKAY acks sent and the max payload size.
-func (r *LocalSocket) Handle(pkt aproto.Packet) {
-	if pkt.Command != aproto.A_WRTE && pkt.Command != aproto.A_CLSE {
+// you are doing something wrong since an Conn's Read can't be used concurrently
+// either). It will block if it receives more A_WRTE packets than allowed given
+// the A_OKAY acks sent and the max payload size.
+func (r *LocalSocket) Handle(pkt Packet) {
+	if pkt.Command != A_WRTE && pkt.Command != A_CLSE {
 		return
 	}
 	if r.Local != SocketAddr(pkt.Arg1) || r.Remote != SocketAddr(pkt.Arg0) {
@@ -102,7 +99,7 @@ func (r *LocalSocket) Handle(pkt aproto.Packet) {
 
 	r.initLocked()
 
-	if pkt.Command == aproto.A_CLSE {
+	if pkt.Command == A_CLSE {
 		if !r.eof {
 			r.eof = true
 			close(r.notifyData) // wake up all pending and future readers
@@ -198,12 +195,12 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 	}
 	if r.DelayedAck == 0 {
 		// if not delayed ack, send an okay
-		if err := r.Send(aproto.A_OKAY, uint32(r.Local), uint32(r.Remote), nil); err != nil {
+		if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), nil); err != nil {
 			return 0, fmt.Errorf("failed to ack data: %w", err)
 		}
 	} else {
 		// if delayed ack, send an okay with the amount we read
-		if err := r.Send(aproto.A_OKAY, uint32(r.Local), uint32(r.Remote), binary.BigEndian.AppendUint32(nil, uint32(n))); err != nil {
+		if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), binary.BigEndian.AppendUint32(nil, uint32(n))); err != nil {
 			return 0, fmt.Errorf("failed to ack data: %w", err)
 		}
 	}
@@ -261,9 +258,9 @@ type RemoteSocket struct {
 	Local  SocketAddr
 	Remote SocketAddr
 
-	MaxPayload uint32                                                                // required
-	DelayedAck uint32                                                                // required, zero if delayed ack disabled
-	Send       func(cmd aproto.Command, arg0 uint32, arg1 uint32, data []byte) error // must be safe to be called concurrently
+	MaxPayload uint32                                                         // required
+	DelayedAck uint32                                                         // required, zero if delayed ack disabled
+	Send       func(cmd Command, arg0 uint32, arg1 uint32, data []byte) error // must be safe to be called concurrently
 
 	deadline deadline
 	closer   closer
@@ -292,10 +289,10 @@ func (w *RemoteSocket) initLocked() {
 
 // Handle handles a packet. It does not keep references to the packet payload
 // after returning. It must not be called concurrently (if you are trying to,
-// you are doing something wrong since an aproto.Conn's Read can't be used
-// concurrently either).
-func (w *RemoteSocket) Handle(pkt aproto.Packet) {
-	if pkt.Command != aproto.A_OKAY {
+// you are doing something wrong since an Conn's Read can't be used concurrently
+// either).
+func (w *RemoteSocket) Handle(pkt Packet) {
+	if pkt.Command != A_OKAY {
 		return
 	}
 	if w.Local != SocketAddr(pkt.Arg1) || w.Remote != SocketAddr(pkt.Arg0) {
@@ -376,7 +373,7 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 		} else {
 			n = min(n, int(w.MaxPayload))
 		}
-		if err := w.Send(aproto.A_WRTE, uint32(w.Local), uint32(w.Remote), b[:n]); err != nil {
+		if err := w.Send(A_WRTE, uint32(w.Local), uint32(w.Remote), b[:n]); err != nil {
 			return total, fmt.Errorf("failed to write data: %w", err)
 		}
 		if w.DelayedAck != 0 {
@@ -400,7 +397,7 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 // It is simlar to a TCP shutdown(SHUT_WR).
 func (w *RemoteSocket) Close() error {
 	return w.closer.Close(func() error {
-		return w.Send(aproto.A_CLSE, uint32(w.Local), uint32(w.Remote), nil)
+		return w.Send(A_CLSE, uint32(w.Local), uint32(w.Remote), nil)
 	})
 }
 
@@ -440,20 +437,20 @@ var (
 	_ shutdownWR = (*SocketPair)(nil)
 )
 
-func (d *SocketPair) Handle(pkt aproto.Packet) {
+func (d *SocketPair) Handle(pkt Packet) {
 	if d.LS == nil || d.RS == nil || d.LS.Local != d.RS.Local || d.LS.Remote != d.RS.Remote {
 		panic("not a socket pair")
 	}
-	if pkt.Command != aproto.A_WRTE && pkt.Command != aproto.A_CLSE && pkt.Command != aproto.A_OKAY {
+	if pkt.Command != A_WRTE && pkt.Command != A_CLSE && pkt.Command != A_OKAY {
 		return
 	}
 	if d.LS.Local != SocketAddr(pkt.Arg1) || d.RS.Remote != SocketAddr(pkt.Arg0) {
 		return
 	}
 	switch pkt.Command {
-	case aproto.A_WRTE, aproto.A_CLSE:
+	case A_WRTE, A_CLSE:
 		d.LS.Handle(pkt)
-	case aproto.A_OKAY:
+	case A_OKAY:
 		d.RS.Handle(pkt)
 	}
 }

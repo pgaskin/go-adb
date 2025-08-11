@@ -30,7 +30,6 @@ import (
 )
 
 // TODO: implement DialADB
-// TODO: test delayed acks more throughly
 
 var debug *slog.Logger
 
@@ -885,18 +884,18 @@ func (t *Transport) serve(ctx context.Context) {
 				debug.Debug("opened service")
 
 				var (
-					local  = MakeSocketAddress()
-					remote = SocketAddr(msg.Arg0)
+					local  = aproto.MakeSocketAddress()
+					remote = aproto.SocketAddr(msg.Arg0)
 				)
 
-				pair := &SocketPair{
-					LS: &LocalSocket{
+				pair := &aproto.SocketPair{
+					LS: &aproto.LocalSocket{
 						Local:      local,
 						Remote:     remote,
 						MaxPayload: t.aproto.MaxPayloadSize(),
 						Send:       t.send,
 					},
-					RS: &RemoteSocket{
+					RS: &aproto.RemoteSocket{
 						Local:      local,
 						Remote:     remote,
 						MaxPayload: t.aproto.MaxPayloadSize(),
@@ -920,7 +919,7 @@ func (t *Transport) serve(ctx context.Context) {
 					defer debug.Debug("closed service")
 					defer unregister()
 
-					LocalServiceSocket(pair, lss)
+					aproto.LocalServiceSocket(pair, lss)
 				}()
 			}
 			if t.server.LazyOpen {
@@ -939,7 +938,7 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			pair := t.findSocket(SocketAddr(msg.Arg1), 0)
+			pair := t.findSocket(aproto.SocketAddr(msg.Arg1), 0)
 			if pair == nil {
 				// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
 				break
@@ -960,7 +959,7 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			pair := t.findSocket(SocketAddr(msg.Arg1), SocketAddr(msg.Arg0))
+			pair := t.findSocket(aproto.SocketAddr(msg.Arg1), aproto.SocketAddr(msg.Arg0))
 			if pair == nil {
 				debug.Debug("cannot find stream to close, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
 				goto ignore
@@ -981,7 +980,7 @@ func (t *Transport) serve(ctx context.Context) {
 				return
 			}
 
-			pair := t.findSocket(SocketAddr(msg.Arg1), SocketAddr(msg.Arg0))
+			pair := t.findSocket(aproto.SocketAddr(msg.Arg1), aproto.SocketAddr(msg.Arg0))
 			if pair == nil {
 				debug.Debug("cannot find stream to write, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
 				goto ignore
@@ -1022,7 +1021,7 @@ func (t *Transport) handshake(serverCert *tls.Certificate, verify func(peerCert 
 	return t.aproto.Handshake(serverCert, verify)
 }
 
-func (t *Transport) findSocket(local, remote SocketAddr) *SocketPair {
+func (t *Transport) findSocket(local, remote aproto.SocketAddr) *aproto.SocketPair {
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
 	for s := range t.streams {
@@ -1033,7 +1032,7 @@ func (t *Transport) findSocket(local, remote SocketAddr) *SocketPair {
 	return nil
 }
 
-func (t *Transport) registerSocket(pair *SocketPair, lss net.Conn) (unregister func()) {
+func (t *Transport) registerSocket(pair *aproto.SocketPair, lss net.Conn) (unregister func()) {
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
 
@@ -1058,10 +1057,10 @@ func (t *Transport) registerSocket(pair *SocketPair, lss net.Conn) (unregister f
 }
 
 type stream struct {
-	local  SocketAddr
-	remote SocketAddr
+	local  aproto.SocketAddr
+	remote aproto.SocketAddr
 	lss    net.Conn
-	pair   *SocketPair
+	pair   *aproto.SocketPair
 }
 
 // DeviceBanner creates a banner for the specified adb server. If srv implements
