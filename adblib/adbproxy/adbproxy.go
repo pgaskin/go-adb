@@ -13,10 +13,8 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"log/slog"
 	mrand "math/rand/v2"
 	"net"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -31,24 +29,7 @@ import (
 
 // TODO: implement DialADB
 
-var debug *slog.Logger
-
 var globalSocketAddr atomic.Uint32 // we could do it per-transport, but this is nicer for debugging
-
-func init() {
-	if v, _ := strconv.ParseBool(os.Getenv("ADBPROXY_TRACE")); v {
-		debug = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
-		}))
-	} else {
-		debug = slog.New(slog.DiscardHandler)
-	}
-}
-
-// Trace enables debug logging to the specified logger.
-func Trace(logger *slog.Logger) {
-	debug = logger
-}
 
 var ErrServerClosed = errors.New("server closed")
 
@@ -210,14 +191,8 @@ func (s *Server) loadBanner(ctx context.Context) error {
 			if s.DelayedAck && s.LocalDelayedAck != 0 {
 				banner.Features[adbproto.FeatureDelayedAck] = struct{}{}
 			}
-			if err := banner.Valid(); err != nil {
-				debug.Warn("invalid banner, using anyways", "error", err, "banner", banner.Encode())
-			}
 			return banner.Encode(), nil
 		}()
-		if s.bannerErr == nil {
-			debug.Debug("generated banner", "banner", s.banner)
-		}
 	})
 	return s.bannerErr
 }
@@ -301,14 +276,21 @@ func (s *Server) Serve(l net.Listener) error {
 			panic("BaseContext returned a nil context")
 		}
 	}
+	trace := contextServerTrace(ctx)
 
 	if err := s.loadBanner(lctx); err != nil {
 		return fmt.Errorf("load banner: %w", err)
+	}
+	if trace != nil && trace.BannerGenerated != nil {
+		trace.BannerGenerated(s.banner)
 	}
 
 	if s.TLS {
 		if err := s.loadCertificate(); err != nil {
 			return fmt.Errorf("generate tls certificate: %w", err)
+		}
+		if trace != nil && trace.CertificateGenerated != nil {
+			trace.CertificateGenerated(s.cert)
 		}
 	}
 
@@ -326,17 +308,17 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 			return err
 		}
+		delay = 0
 
 		t := s.newTransport(c)
 
 		cctx := context.WithValue(lctx, transportContextKey{}, t)
 		if s.ConnContext != nil {
-			cctx = s.ConnContext(lctx, c)
+			cctx = s.ConnContext(cctx, c)
 			if cctx == nil {
 				panic("ConnContext returned nil")
 			}
 		}
-		delay = 0
 
 		go func() {
 			s.trackTransport(t, true)
@@ -479,6 +461,8 @@ type Transport struct {
 	sig     []byte // first auth signature
 	adbkey  []byte // presented adbkey during legacy auth (not necessairly the one used for auth) (note: we only need to keep one since adb only sends the primary adbkey, not vendorkeys)
 	adbkeyp *aproto.PublicKey
+
+	traceWrite func(cmd aproto.Command, arg0 uint32, arg1 uint32, data []byte)
 }
 
 func (s *Server) newTransport(conn net.Conn) *Transport {
@@ -626,11 +610,18 @@ func (t *Transport) Features() iter.Seq[adbproto.Feature] {
 // serve runs the main loop for the connection. It blocks until the transport
 // has been kicked.
 func (t *Transport) serve(ctx context.Context) {
+	trace := contextServerTrace(ctx)
+	if trace != nil && trace.Accepted != nil {
+		trace.Accepted()
+	}
+	if trace != nil && trace.Kicked != nil {
+		defer func() { trace.Kicked(t.Error()) }()
+	}
+	if trace != nil && trace.PacketSent != nil {
+		t.traceWrite = trace.PacketSent
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	debug := debug.With("remote", t.RemoteAddr().String())
-	defer func() { debug.Info("kick", "error", t.Error()) }()
-	debug.Info("accept")
 	defer func() { t.Kick(nil) }()
 	var authenticator Authenticator
 	if t.server.Auth != nil {
@@ -640,6 +631,12 @@ func (t *Transport) serve(ctx context.Context) {
 		msg, data, ok := t.aproto.Read()
 		if !ok {
 			return
+		}
+		if trace != nil && trace.PacketReceived != nil {
+			trace.PacketReceived(aproto.Packet{
+				Message: msg,
+				Payload: data,
+			})
 		}
 		switch msg.Command {
 		case aproto.A_CNXN: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=407-433;drc=61197364367c9e404c7da6900658f1b16c42d0da
@@ -661,9 +658,6 @@ func (t *Transport) serve(ctx context.Context) {
 				t.banner = banner
 			}()
 
-			debug.Info("connect", "banner", string(data), "use_tls", t.useTLS)
-			close(t.connected)
-
 			t.useTLS = t.server.TLS
 
 			// HACK: disable tls unless a feature introduced since then is there
@@ -674,10 +668,12 @@ func (t *Transport) serve(ctx context.Context) {
 						break
 					}
 				}
-				if !t.useTLS {
-					debug.Warn("disabling tls since client seems too old")
-				}
 			}
+
+			if trace != nil && trace.Connected != nil {
+				trace.Connected(string(data), t.useTLS)
+			}
+			close(t.connected)
 
 			switch {
 			case t.useTLS:
@@ -686,7 +682,9 @@ func (t *Transport) serve(ctx context.Context) {
 					return
 				}
 			case authenticator == nil:
-				debug.Info("authenticated")
+				if trace != nil && trace.Authenticated != nil {
+					trace.Authenticated()
+				}
 				close(t.authenticated)
 
 				if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
@@ -721,8 +719,6 @@ func (t *Transport) serve(ctx context.Context) {
 
 			switch msg.Arg0 {
 			case aproto.AuthSignature:
-				debug.Debug("got new signature")
-
 				if t.sig == nil {
 					t.sig = slices.Clone(data)
 				}
@@ -737,14 +733,15 @@ func (t *Transport) serve(ctx context.Context) {
 				}
 				if !authenticator.Auth(auth) {
 					// ask for another key
-					debug.Debug("auth rejected, asking for the next signature")
 					if !t.write(aproto.A_AUTH, aproto.AuthToken, 0, t.token[:]) {
 						return
 					}
 					continue
 				}
 
-				debug.Info("authenticated")
+				if trace != nil && trace.Authenticated != nil {
+					trace.Authenticated()
+				}
 				close(t.authenticated)
 
 				if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
@@ -753,13 +750,11 @@ func (t *Transport) serve(ctx context.Context) {
 
 			case aproto.AuthRSAPublicKey:
 				raw := stripTrailingNulls(data)
-				key, name, err := aproto.ParsePublicKey(raw)
+				key, _, err := aproto.ParsePublicKey(raw)
 				if err != nil {
-					debug.Warn("ignoring invalid pubkey", "err", err, "raw", string(raw))
 					continue
 				}
 
-				debug.Debug("got new pubkey", "fingerprint", key.Fingerprint(), "name", name)
 				t.adbkey = slices.Clone(raw)
 				t.adbkeyp = key
 
@@ -772,7 +767,9 @@ func (t *Transport) serve(ctx context.Context) {
 					}
 					if auth.verifyInternal(t.adbkeyp) {
 						if authenticator.Auth(auth) {
-							debug.Info("authenticated")
+							if trace != nil && trace.Authenticated != nil {
+								trace.Authenticated()
+							}
 							close(t.authenticated)
 
 							if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
@@ -788,7 +785,6 @@ func (t *Transport) serve(ctx context.Context) {
 					continue
 				}
 
-				debug.Debug("doing auth again")
 				if _, err := rand.Read(t.token[:]); err != nil {
 					t.Kick(fmt.Errorf("auth: failed to generate token: %w", err))
 					return
@@ -798,7 +794,12 @@ func (t *Transport) serve(ctx context.Context) {
 				}
 
 			default:
-				debug.Warn("unhandled packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
+				if trace != nil && trace.PacketUnknown != nil {
+					trace.PacketUnknown(aproto.Packet{
+						Message: msg,
+						Payload: data,
+					})
+				}
 			}
 
 		case aproto.A_STLS: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/daemon/auth.cpp;l=358-383;drc=61197364367c9e404c7da6900658f1b16c42d0da;bpv=1;bpt=1
@@ -813,8 +814,6 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore // ignore all stls packets when not using tls
 			}
 
-			debug.Info("stls")
-
 			if t.server.cert == nil {
 				panic("adbproxy: server cert is nil") // it should have been generated at startup
 			}
@@ -823,11 +822,6 @@ func (t *Transport) serve(ctx context.Context) {
 			if !t.handshake(t.server.cert, func(peerCert *x509.Certificate) {
 				auth := &AuthCertificate{
 					Raw: peerCert.Raw,
-				}
-				if pk, _ := auth.PublicKey(); pk != nil {
-					debug.Debug("got cert", "alg", peerCert.PublicKeyAlgorithm, "sigalg", peerCert.SignatureAlgorithm, "subject", peerCert.Subject, "fingerprint", pk.Fingerprint())
-				} else {
-					debug.Warn("got malformed cert", "alg", peerCert.PublicKeyAlgorithm, "sigalg", peerCert.SignatureAlgorithm, "subject", peerCert.Subject)
 				}
 				if !verified && authenticator != nil {
 					verified = authenticator.Auth(auth)
@@ -840,7 +834,9 @@ func (t *Transport) serve(ctx context.Context) {
 				return
 			}
 
-			debug.Info("authenticated")
+			if trace != nil && trace.Authenticated != nil {
+				trace.Authenticated()
+			}
 			close(t.authenticated)
 
 			if !t.write(aproto.A_CNXN, t.aproto.ProtocolVersion(), t.aproto.MaxPayloadSize(), []byte(t.server.banner)) {
@@ -860,11 +856,14 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			debug := debug.With("id", msg.Arg0)
-
 			svc := string(stripTrailingNulls(data))
 
 			fn := func() {
+				var (
+					local  = globalSocketAddr.Add(1)
+					remote = msg.Arg0
+				)
+
 				sctx := ctx
 				if t.server.OpenContext != nil {
 					sctx = t.server.OpenContext(sctx, svc)
@@ -875,25 +874,28 @@ func (t *Transport) serve(ctx context.Context) {
 
 				if t.server.DelayedAck {
 					if delayedAckRequested := msg.Arg1 != 0; delayedAckRequested && !t.SupportsFeature(adbproto.FeatureDelayedAck) {
-						debug.Warn("client requested delayed acks but didn't declare support for it")
+						if trace != nil && trace.LocalServiceFail != nil {
+							trace.LocalServiceFail(local, remote, errors.New("client requested delayed acks but didn't declare support for it"))
+						}
 						t.write(aproto.A_CLSE, 0, msg.Arg0, nil)
 						return
 					}
 				}
 
-				debug.Debug("dialing", "svc", svc)
+				if trace != nil && trace.LocalServiceDial != nil {
+					trace.LocalServiceDial(local, remote, svc)
+				}
 				lss, err := t.server.Dialer.DialADB(sctx, svc)
 				if err != nil {
-					debug.Debug("failed to open service", "err", err)
+					if trace != nil && trace.LocalServiceFail != nil {
+						trace.LocalServiceFail(local, remote, err)
+					}
 					t.write(aproto.A_CLSE, 0, msg.Arg0, nil)
 					return
 				}
-				debug.Debug("opened service")
-
-				var (
-					local  = globalSocketAddr.Add(1)
-					remote = msg.Arg0
-				)
+				if trace != nil && trace.LocalServiceSuccess != nil {
+					trace.LocalServiceSuccess(local, remote)
+				}
 
 				ls := &aproto.LocalSocket{
 					Local:      local,
@@ -910,7 +912,9 @@ func (t *Transport) serve(ctx context.Context) {
 				if t.server.DelayedAck && t.SupportsFeature(adbproto.FeatureDelayedAck) {
 					ls.DelayedAck = uint32(t.server.LocalDelayedAck)
 					rs.DelayedAck = msg.Arg1 // the client's delayed ack (note: for the adb host daemon, ADB_BURST_MODE=1 is required to enable this)
-					debug.Debug("using delayed acks", "ls", ls.DelayedAck, "rs", rs.DelayedAck)
+					if trace != nil && trace.LocalServiceDelayedAck != nil {
+						trace.LocalServiceDelayedAck(local, remote, ls.DelayedAck, rs.DelayedAck)
+					}
 				}
 				unregister := t.registerSocket(ls, rs, lss)
 
@@ -921,7 +925,9 @@ func (t *Transport) serve(ctx context.Context) {
 				}
 
 				go func() {
-					defer debug.Debug("closed service")
+					if trace != nil && trace.LocalServiceClose != nil {
+						trace.LocalServiceSuccess(local, remote)
+					}
 					defer unregister()
 
 					aproto.LocalServiceSocket(ls, rs, lss)
@@ -946,6 +952,12 @@ func (t *Transport) serve(ctx context.Context) {
 			pair := t.findSocket(msg.Arg1, 0)
 			if pair == nil {
 				// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
+				if trace != nil && trace.PacketSocketUnknown != nil {
+					trace.PacketSocketUnknown(aproto.Packet{
+						Message: msg,
+						Payload: data,
+					})
+				}
 				break
 			}
 
@@ -966,7 +978,12 @@ func (t *Transport) serve(ctx context.Context) {
 
 			pair := t.findSocket(msg.Arg1, msg.Arg0)
 			if pair == nil {
-				debug.Debug("cannot find stream to close, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
+				if trace != nil && trace.PacketSocketUnknown != nil {
+					trace.PacketSocketUnknown(aproto.Packet{
+						Message: msg,
+						Payload: data,
+					})
+				}
 				goto ignore
 			}
 
@@ -987,7 +1004,12 @@ func (t *Transport) serve(ctx context.Context) {
 
 			pair := t.findSocket(msg.Arg1, msg.Arg0)
 			if pair == nil {
-				debug.Debug("cannot find stream to write, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
+				if trace != nil && trace.PacketSocketUnknown != nil {
+					trace.PacketSocketUnknown(aproto.Packet{
+						Message: msg,
+						Payload: data,
+					})
+				}
 				goto ignore
 			}
 
@@ -997,11 +1019,21 @@ func (t *Transport) serve(ctx context.Context) {
 			})
 
 		default:
-			debug.Warn("unhandled packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
+			if trace != nil && trace.PacketUnknown != nil {
+				trace.PacketUnknown(aproto.Packet{
+					Message: msg,
+					Payload: data,
+				})
+			}
 		}
 		continue
 	ignore:
-		debug.Warn("ignoring packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
+		if trace != nil && trace.PacketIgnored != nil {
+			trace.PacketIgnored(aproto.Packet{
+				Message: msg,
+				Payload: data,
+			})
+		}
 	}
 }
 
@@ -1014,6 +1046,9 @@ func (t *Transport) send(cmd aproto.Command, arg0 uint32, arg1 uint32, data []by
 
 // write locks writeMu and sends packets.
 func (t *Transport) write(cmd aproto.Command, arg0 uint32, arg1 uint32, data []byte) bool {
+	if t.traceWrite != nil {
+		t.traceWrite(cmd, arg0, arg1, data)
+	}
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	return t.aproto.Write(cmd, arg0, arg1, data)
