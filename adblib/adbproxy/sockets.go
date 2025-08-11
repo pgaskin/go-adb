@@ -18,6 +18,7 @@ import (
 )
 
 // TODO: move this to adb/adbproto/aproto
+// TODO: actually test delayed acks
 
 // SocketAddr is an ADB socket address, unique on the end it was created on. A
 // zero socket address is invalid.
@@ -155,10 +156,6 @@ func (r *LocalSocket) Handle(pkt aproto.Packet) {
 // Read reads data from the stream up to len(b), returning the number of bytes
 // read (n > 0). On EOF, it returns (0, io.EOF).
 func (r *LocalSocket) Read(b []byte) (int, error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -167,6 +164,10 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 	// check if closed
 	if r.closer.IsClosed() {
 		return 0, net.ErrClosed
+	}
+
+	if len(b) == 0 {
+		return 0, nil
 	}
 
 	// wait for data to be available
@@ -232,6 +233,9 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 
 // SetDeadline sets the deadline for future and pending Read calls. A zero value
 // for t means Read will not time out.
+//
+// The deadline does not propagate to sending the ACKs; it only affects the time
+// to wait for the data to arrive.
 func (r *LocalSocket) SetDeadline(t time.Time) {
 	r.deadline.Set(t)
 }
@@ -251,8 +255,6 @@ func (r *LocalSocket) Close() error {
 // A_WRTE/A_CLSE packets and receives A_OKAY onces). It is safe for concurrent
 // use.
 //
-// This is known as a "remote socket" in ADB.
-//
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
 type RemoteSocket struct {
@@ -266,17 +268,26 @@ type RemoteSocket struct {
 	deadline deadline
 	closer   closer
 
-	initOnce sync.Once
+	mu     sync.Mutex
+	notify chan struct{}
+	asb    int32
+	pkt    int
 }
 
 var _ io.WriteCloser = (*RemoteSocket)(nil)
 
-func (w *RemoteSocket) init() {
-	w.initOnce.Do(func() {
-		if w.Local == 0 || w.Remote == 0 || w.MaxPayload == 0 || w.Send == nil {
-			panic("remote socket missing required fields")
+func (w *RemoteSocket) initLocked() {
+	if w.Local == 0 || w.Remote == 0 || w.MaxPayload == 0 || w.Send == nil {
+		panic("remote socket missing required fields")
+	}
+	if w.notify == nil {
+		w.notify = make(chan struct{})
+		if w.DelayedAck != 0 {
+			w.asb = int32(w.DelayedAck)
+		} else {
+			w.pkt = 1
 		}
-	})
+	}
 }
 
 // Handle handles a packet. It does not keep references to the packet payload
@@ -284,16 +295,101 @@ func (w *RemoteSocket) init() {
 // you are doing something wrong since an aproto.Conn's Read can't be used
 // concurrently either).
 func (w *RemoteSocket) Handle(pkt aproto.Packet) {
-	w.init()
-	//panic("not implemented")
+	if pkt.Command != aproto.A_OKAY {
+		return
+	}
+	if w.Local != SocketAddr(pkt.Arg1) || w.Remote != SocketAddr(pkt.Arg0) {
+		return
+	}
+
+	var acked int32
+	if len(pkt.Payload) != 0 {
+		if len(pkt.Payload) != 4 {
+			return
+		}
+		acked = int32(binary.LittleEndian.Uint32(pkt.Payload)) // yes, it can be negative for backpressure (it isn't currently used, but it can be)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.initLocked()
+
+	if w.DelayedAck != 0 {
+		w.asb += acked
+		if w.asb <= 0 {
+			return
+		}
+	} else {
+		w.pkt++
+		if w.pkt <= 0 {
+			return
+		}
+	}
+
+	select {
+	case w.notify <- struct{}{}:
+	default:
+	}
 }
 
 // Write writes data to the stream. It returns the number of bytes written to
 // the stream. If err is nil, n == len(b).
 func (w *RemoteSocket) Write(b []byte) (int, error) {
-	w.init()
-	//panic("not implemented")
-	return 0, errors.ErrUnsupported
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.initLocked()
+
+	if w.closer.IsClosed() {
+		return 0, net.ErrClosed
+	}
+
+	var total int
+	for len(b) != 0 {
+		for {
+			if w.DelayedAck != 0 {
+				if w.asb > 0 {
+					break
+				}
+			} else {
+				if w.pkt > 0 {
+					break
+				}
+			}
+			w.mu.Unlock()
+			select {
+			case <-w.deadline.Done():
+				w.mu.Lock()
+				return 0, os.ErrDeadlineExceeded
+			case <-w.closer.Closed():
+				w.mu.Lock()
+				return 0, net.ErrClosed
+			case <-w.notify:
+			}
+			w.mu.Lock()
+		}
+
+		n := len(b)
+		if w.DelayedAck != 0 {
+			n = min(n, int(w.asb)) // note: Send will split it into multiple WRTE packets for us if it's greater than MaxPayload
+		} else {
+			n = min(n, int(w.MaxPayload))
+		}
+		if err := w.Send(aproto.A_WRTE, uint32(w.Local), uint32(w.Remote), b[:n]); err != nil {
+			return total, fmt.Errorf("failed to write data: %w", err)
+		}
+		if w.DelayedAck != 0 {
+			w.asb -= int32(n)
+		} else {
+			w.pkt--
+		}
+		b = b[n:]
+
+		total += n
+	}
+
+	return total, nil
 }
 
 // Close closes the stream. This preempts any writes which have not started yet
@@ -304,13 +400,16 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 // It is simlar to a TCP shutdown(SHUT_WR).
 func (w *RemoteSocket) Close() error {
 	return w.closer.Close(func() error {
-		return w.Send(aproto.A_CLSE, uint32(w.Remote), uint32(w.Local), nil)
+		return w.Send(aproto.A_CLSE, uint32(w.Local), uint32(w.Remote), nil)
 	})
 }
 
 // SetDeadline sets the deadline for future and pending Write calls. Even if
 // write times out, it may return n > 0, indicating that some of the data was
 // successfully written. A zero value for t means Write will not time out.
+//
+// The deadline does not propagate to sending the data; it only affects the time
+// to wait for the peer to ack the previous data to make room.
 func (w *RemoteSocket) SetDeadline(t time.Time) {
 	w.deadline.Set(t)
 }
@@ -423,33 +522,66 @@ func (d *SocketPair) SetWriteDeadline(t time.Time) error {
 // socket pair, then closes both sockets.
 func LocalServiceSocket(p *SocketPair, lss net.Conn) error {
 	var (
-		readCh  = make(chan error, 1)
-		writeCh = make(chan error, 1)
+		readCh     = make(chan error, 1)
+		writeCh    = make(chan error, 1)
+		lssCloseCh = make(chan error, 1)
+		lsCloseCh  = make(chan error, 1)
+		rsCloseCh  = make(chan error, 1)
 	)
 	go func() {
+		defer func() {
+			// this doesn't do anything unless the user is doing weird stuff,
+			// but let's just call it for completeness
+			err := p.LS.Close()
+			if err != nil {
+				err = fmt.Errorf("close local socket: %w", err)
+			}
+			lsCloseCh <- err
+		}()
+		defer func() {
+			// the client told us to go away, so tell our local service to go
+			// away as well
+			err := lss.Close()
+			if err != nil {
+				err = fmt.Errorf("close local service socket: %w", err)
+			}
+			lssCloseCh <- err
+		}()
 		b := make([]byte, cmp.Or(p.LS.DelayedAck, p.LS.MaxPayload))
 		for {
 			nr, err := p.LS.Read(b)
 			if err == io.EOF {
+				// we received a CLSE from the client since they want us to go
+				// away or we closed RS and they finished reading it
 				readCh <- nil
 				return
 			}
 			if err != nil {
-				readCh <- fmt.Errorf("read ls: %w", err)
+				readCh <- fmt.Errorf("read local socket: %w", err)
 				return
 			}
 			nw, err := lss.Write(b[:nr])
 			if err != nil {
-				readCh <- fmt.Errorf("write lss: %w", err)
+				readCh <- fmt.Errorf("write local service socket: %w", err)
 				return
 			}
 			if nr != nw {
-				writeCh <- fmt.Errorf("write lss: %w", io.ErrShortWrite)
+				readCh <- fmt.Errorf("write local service socket: %w", io.ErrShortWrite)
 				return
 			}
 		}
 	}()
 	go func() {
+		defer func() {
+			// tell the client we have no more data for it, so it will finish
+			// reading, then send us a CLSE (which will make the LS EOF once we
+			// finish reading it)
+			err := p.RS.Close()
+			if err != nil {
+				err = fmt.Errorf("close remote socket: %q", err)
+			}
+			rsCloseCh <- err
+		}()
 		b := make([]byte, cmp.Or(p.LS.DelayedAck, p.LS.MaxPayload))
 		for {
 			nr, err := lss.Read(b)
@@ -458,33 +590,28 @@ func LocalServiceSocket(p *SocketPair, lss net.Conn) error {
 				return
 			}
 			if err != nil {
-				writeCh <- fmt.Errorf("read lss: %w", err)
+				writeCh <- fmt.Errorf("read local service socket: %w", err)
 				return
 			}
 			nw, err := p.RS.Write(b[:nr])
 			if err != nil {
-				writeCh <- fmt.Errorf("write rs: %w", err)
+				writeCh <- fmt.Errorf("write remote socket: %w", err)
 				return
 			}
 			if nr != nw {
-				writeCh <- fmt.Errorf("write rs: %w", io.ErrShortWrite)
+				writeCh <- fmt.Errorf("write remote socket: %w", io.ErrShortWrite)
 				return
 			}
 		}
 	}()
 	var (
-		readErr  = <-readCh
-		writeErr = <-writeCh
+		readErr     = <-readCh
+		writeErr    = <-writeCh
+		lssCloseErr = <-lssCloseCh
+		lsCloseErr  = <-lsCloseCh
+		rsCloseErr  = <-rsCloseCh
 	)
-	closeErr1 := p.Close()
-	if closeErr1 != nil {
-		closeErr1 = fmt.Errorf("close ls/rs: %w", closeErr1)
-	}
-	closeErr2 := lss.Close()
-	if closeErr2 != nil {
-		closeErr2 = fmt.Errorf("close lss: %w", closeErr2)
-	}
-	return errors.Join(readErr, writeErr, closeErr1, closeErr2)
+	return errors.Join(readErr, writeErr, rsCloseErr, lsCloseErr, lssCloseErr)
 }
 
 // deadline implements stuff needed for deadlines on connection implementations.

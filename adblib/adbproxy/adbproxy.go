@@ -29,9 +29,8 @@ import (
 	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 )
 
-// TODO: rewrite and optimize stream logic
 // TODO: implement DialADB
-// TODO: finish implementing and testing delayed ack
+// TODO: test delayed acks more throughly
 
 var debug *slog.Logger
 
@@ -124,10 +123,20 @@ type Server struct {
 	// This is non-standard behaviour.
 	LazyOpen bool
 
-	// If nonzero, delayed ack will be supported with the specified size. This
-	// must also be supported by the Dialer (if backed by adbd, ADB_BURST_MODE
-	// must be set).
-	DelayedAck int
+	// If true, delayed ack will be supported by the proxy. This must also be
+	// supported by the ADB client connecting to adbproxy (if backed by adbd,
+	// ADB_BURST_MODE must be set).
+	DelayedAck bool
+
+	// If DelayedAck is true and this is nonzero, delayed ack will be supported
+	// for our half of the socket pairs with the specified size.
+	//
+	// Currently, ADB hardcodes this to 33554432 bytes, but it should
+	// theoretically support anything. However, making this smaller than the
+	// maximum payload size is counterproductive.
+	//
+	// https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=543-544;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
+	LocalDelayedAck int
 
 	// BaseContext optionally specifies a function that returns the base context
 	// for incoming requests on this server. The provided Listener is the
@@ -197,7 +206,7 @@ func (s *Server) loadBanner(ctx context.Context) error {
 					delete(banner.Features, f)
 				}
 			}
-			if s.DelayedAck != 0 {
+			if s.DelayedAck && s.LocalDelayedAck != 0 {
 				banner.Features[adbproto.FeatureDelayedAck] = struct{}{}
 			}
 			if err := banner.Valid(); err != nil {
@@ -270,10 +279,7 @@ func (s *Server) ListenAndServe() error {
 // Serve accepts incoming connections on the Listener l, creating a new service
 // goroutine for each.
 func (s *Server) Serve(l net.Listener) error {
-	if s.DelayedAck != 0 {
-		panic("delayed ack not implemented") // TODO: figure out the rest of it, refactor (also see https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/delayed_ack.md)
-	}
-	if s.DelayedAck < 0 || s.DelayedAck > 0xFFFFFFFF {
+	if s.LocalDelayedAck < 0 || s.LocalDelayedAck > 0xFFFFFFFF {
 		return fmt.Errorf("delayed ack bytes out of range")
 	}
 
@@ -464,7 +470,6 @@ type Transport struct {
 	kicked  chan struct{}
 
 	streamsMu sync.Mutex
-	stream    uint32
 	streams   map[*stream]struct{}
 
 	// must only be used within the main loop
@@ -547,6 +552,24 @@ func (t *Transport) Kick(err error) {
 	t.kickMu.Unlock()
 
 	t.conn.Close()
+
+	// close streams (just in case they're stuck on IO -- especially the local
+	// service sockets -- and are still lingering)
+	//
+	// do it in a new goroutine just in case anything is misbehaving (since the
+	// net.Conn objects come from user-provided implementations)
+	go func() {
+		t.streamsMu.Lock()
+		defer t.streamsMu.Unlock()
+
+		for stream := range t.streams {
+			stream.pair.Close()
+			if stream.lss != nil {
+				stream.lss.Close()
+			}
+			delete(t.streams, stream)
+		}
+	}()
 }
 
 var (
@@ -831,12 +854,6 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			if msg.Arg1 != uint32(t.server.DelayedAck) {
-				debug.Warn("unexpected OPEN delayed acks", "exp", t.server.DelayedAck, "act", msg.Arg1)
-				t.write(aproto.A_CLSE, 0, msg.Arg0, nil)
-				continue
-			}
-
 			debug := debug.With("id", msg.Arg0)
 
 			svc := string(stripTrailingNulls(data))
@@ -850,8 +867,16 @@ func (t *Transport) serve(ctx context.Context) {
 					}
 				}
 
+				if t.server.DelayedAck {
+					if delayedAckRequested := msg.Arg1 != 0; delayedAckRequested && !t.SupportsFeature(adbproto.FeatureDelayedAck) {
+						debug.Warn("client requested delayed acks but didn't declare support for it")
+						t.write(aproto.A_CLSE, 0, msg.Arg0, nil)
+						return
+					}
+				}
+
 				debug.Debug("dialing", "svc", svc)
-				conn, err := t.server.Dialer.DialADB(sctx, svc)
+				lss, err := t.server.Dialer.DialADB(sctx, svc)
 				if err != nil {
 					debug.Debug("failed to open service", "err", err)
 					t.write(aproto.A_CLSE, 0, msg.Arg0, nil)
@@ -859,100 +884,44 @@ func (t *Transport) serve(ctx context.Context) {
 				}
 				debug.Debug("opened service")
 
-				// TODO: refactor into t.newStream
-				stream := func() *stream {
-					t.streamsMu.Lock()
-					defer t.streamsMu.Unlock()
-					if t.streams == nil {
-						t.streams = make(map[*stream]struct{})
-					}
-					t.stream++
-					stream := &stream{
-						local:  t.stream,
-						remote: msg.Arg0,
-						device: conn,
-						asb:    int64(t.server.DelayedAck),
-						ready:  make(chan struct{}, 1),
-						wqueue: make(chan []byte, 1),
-					}
-					t.streams[stream] = struct{}{}
-					return stream
-				}()
+				var (
+					local  = MakeSocketAddress()
+					remote = SocketAddr(msg.Arg0)
+				)
 
-				if t.server.DelayedAck != 0 {
-					t.write(aproto.A_OKAY, stream.local, stream.remote, binary.LittleEndian.AppendUint32(nil, uint32(t.server.DelayedAck)))
+				pair := &SocketPair{
+					LS: &LocalSocket{
+						Local:      local,
+						Remote:     remote,
+						MaxPayload: t.aproto.MaxPayloadSize(),
+						Send:       t.send,
+					},
+					RS: &RemoteSocket{
+						Local:      local,
+						Remote:     remote,
+						MaxPayload: t.aproto.MaxPayloadSize(),
+						Send:       t.send,
+					},
+				}
+				if t.server.DelayedAck && t.SupportsFeature(adbproto.FeatureDelayedAck) {
+					pair.LS.DelayedAck = uint32(t.server.LocalDelayedAck)
+					pair.RS.DelayedAck = msg.Arg1 // the client's delayed ack (note: for the adb host daemon, ADB_BURST_MODE=1 is required to enable this)
+					debug.Debug("using delayed acks", "ls", pair.LS.DelayedAck, "rs", pair.RS.DelayedAck)
+				}
+				unregister := t.registerSocket(pair, lss)
+
+				if pair.LS.DelayedAck != 0 {
+					t.write(aproto.A_OKAY, uint32(local), uint32(remote), binary.LittleEndian.AppendUint32(nil, pair.LS.DelayedAck))
 				} else {
-					t.write(aproto.A_OKAY, stream.local, stream.remote, nil)
+					t.write(aproto.A_OKAY, uint32(local), uint32(remote), nil)
 				}
 
-				// TODO: separate read and write socket pair halves (and the device is responsible for closing the one which writes to the client, then we close the other)
-
 				go func() {
-					for data := range stream.wqueue {
-						if _, err := stream.device.Write(data); err != nil {
-							debug.Debug("failed to write to local device socket", "err", err)
-							// don't close the device here; there might be more
-							// to read from it
-							t.write(aproto.A_CLSE, stream.local, stream.remote, nil)
-							// note: the client will send a CLSE back when it
-							// wants to close its end
-							return
-						}
-						// tell the remote we're ready for another WRTE
-						// TODO: do we need to care about delayed acks here?
-						t.write(aproto.A_OKAY, stream.local, stream.remote, nil)
-					}
+					defer debug.Debug("closed service")
+					defer unregister()
+
+					LocalServiceSocket(pair, lss)
 				}()
-
-				go func() {
-					buf := make([]byte, aproto.MessageSize+t.aproto.MaxPayloadSize())
-					for {
-						if t.server.DelayedAck == 0 || func() bool {
-							stream.mu.Lock()
-							defer stream.mu.Unlock()
-							return stream.asb <= 0
-						}() {
-							<-stream.ready
-						}
-
-						payload := buf[aproto.MessageSize:]
-						if t.server.DelayedAck != 0 {
-							asb := func() int64 {
-								stream.mu.Lock()
-								defer stream.mu.Unlock()
-								return stream.asb
-							}()
-							if asb == 0 {
-								continue
-							}
-							if int64(len(payload)) > asb {
-								payload = payload[:asb]
-							}
-						}
-
-						n, err := stream.device.Read(payload)
-						if err != nil {
-							if err != io.EOF {
-								debug.Debug("failed to read from local device socket", "err", err)
-							}
-							stream.device.Close()
-							t.write(aproto.A_CLSE, stream.local, stream.remote, nil)
-							// note: the client will send a CLSE back
-							return
-						}
-						if n > 0 {
-							t.write(aproto.A_WRTE, stream.local, stream.remote, payload[:n])
-							if t.server.DelayedAck != 0 {
-								func() {
-									stream.mu.Lock()
-									defer stream.mu.Unlock()
-									stream.asb -= int64(n)
-								}()
-							}
-						}
-					}
-				}()
-				stream.notifyReady()
 			}
 			if t.server.LazyOpen {
 				go fn()
@@ -970,33 +939,16 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			var acked int32
-			if len(data) != 0 {
-				if len(data) != 4 {
-					debug.Warn("invalid OKAY payload size", "n", len(data))
-					continue
-				}
-				acked = int32(binary.LittleEndian.Uint32(data))
-			}
-
-			stream := t.findLocalSocket(msg.Arg1, 0)
-			if stream == nil {
+			pair := t.findSocket(SocketAddr(msg.Arg1), 0)
+			if pair == nil {
 				// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
 				break
 			}
 
-			func() {
-				stream.mu.Lock()
-				defer stream.mu.Unlock()
-				if t.server.DelayedAck != 0 {
-					stream.asb += int64(acked)
-					if stream.asb > 0 {
-						stream.notifyReady()
-					}
-				} else {
-					stream.notifyReady()
-				}
-			}()
+			pair.Handle(aproto.Packet{
+				Message: msg,
+				Payload: data,
+			})
 
 		case aproto.A_CLSE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=594-616;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
 			select {
@@ -1008,19 +960,16 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			stream := t.findLocalSocket(msg.Arg1, msg.Arg0)
-			if stream == nil {
+			pair := t.findSocket(SocketAddr(msg.Arg1), SocketAddr(msg.Arg0))
+			if pair == nil {
 				debug.Debug("cannot find stream to close, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
 				goto ignore
 			}
 
-			stream.device.Close()
-			stream.notifyReady()
-			func() {
-				t.streamsMu.Lock()
-				defer t.streamsMu.Unlock()
-				delete(t.streams, stream)
-			}()
+			pair.Handle(aproto.Packet{
+				Message: msg,
+				Payload: data,
+			})
 
 		case aproto.A_WRTE: // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/adb.cpp;l=618-625;drc=9f298fb1f3317371b49439efb20a598b3a881bf3
 			select {
@@ -1032,15 +981,16 @@ func (t *Transport) serve(ctx context.Context) {
 				return
 			}
 
-			stream := t.findLocalSocket(msg.Arg1, msg.Arg0)
-			if stream == nil {
+			pair := t.findSocket(SocketAddr(msg.Arg1), SocketAddr(msg.Arg0))
+			if pair == nil {
 				debug.Debug("cannot find stream to write, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
 				goto ignore
 			}
 
-			// if this blocks, it's because the client is misbehaving (sending
-			// more than we've ack'd)
-			stream.wqueue <- slices.Clone(data) // TODO: optimize this, refactor
+			pair.Handle(aproto.Packet{
+				Message: msg,
+				Payload: data,
+			})
 
 		default:
 			debug.Warn("unhandled packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
@@ -1049,6 +999,13 @@ func (t *Transport) serve(ctx context.Context) {
 	ignore:
 		debug.Warn("ignoring packet", "cmd", msg.Command, "arg0", msg.Arg0, "arg1", msg.Arg1, "len", len(data))
 	}
+}
+
+func (t *Transport) send(cmd aproto.Command, arg0 uint32, arg1 uint32, data []byte) error {
+	if !t.write(cmd, arg0, arg1, data) {
+		return t.aproto.Error()
+	}
+	return nil
 }
 
 // write locks writeMu and sends packets.
@@ -1065,34 +1022,46 @@ func (t *Transport) handshake(serverCert *tls.Certificate, verify func(peerCert 
 	return t.aproto.Handshake(serverCert, verify)
 }
 
-func (t *Transport) findLocalSocket(local, remote uint32) *stream {
+func (t *Transport) findSocket(local, remote SocketAddr) *SocketPair {
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
 	for s := range t.streams {
 		if (remote == 0 || s.remote == remote) && s.local == local {
-			return s
+			return s.pair
 		}
 	}
 	return nil
 }
 
-type stream struct {
-	local  uint32
-	remote uint32
-	device net.Conn
-	ready  chan struct{}
-	mu     sync.Mutex
-	asb    int64 // available send bytes (can be negative)
-	wqueue chan []byte
+func (t *Transport) registerSocket(pair *SocketPair, lss net.Conn) (unregister func()) {
+	t.streamsMu.Lock()
+	defer t.streamsMu.Unlock()
+
+	if t.streams == nil {
+		t.streams = make(map[*stream]struct{})
+	}
+
+	stream := &stream{
+		local:  pair.LS.Local,
+		remote: pair.LS.Remote,
+		lss:    lss,
+		pair:   pair,
+	}
+	t.streams[stream] = struct{}{}
+
+	return func() {
+		t.streamsMu.Lock()
+		defer t.streamsMu.Unlock()
+
+		delete(t.streams, stream)
+	}
 }
 
-func (s *stream) notifyReady() {
-	select {
-	case s.ready <- struct{}{}:
-		// notified
-	default:
-		// already have a ready queued (chan buffer is 1)
-	}
+type stream struct {
+	local  SocketAddr
+	remote SocketAddr
+	lss    net.Conn
+	pair   *SocketPair
 }
 
 // DeviceBanner creates a banner for the specified adb server. If srv implements
