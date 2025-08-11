@@ -452,8 +452,9 @@ type Transport struct {
 	kickErr error
 	kicked  chan struct{}
 
-	streamsMu sync.Mutex
-	streams   map[*stream]struct{}
+	streamsMu      sync.Mutex
+	streams        map[*stream]struct{}
+	pendingStreams map[*aproto.LocalSocket]chan *aproto.RemoteSocket
 
 	// must only be used within the main loop
 	useTLS  bool
@@ -576,7 +577,53 @@ func (t *Transport) DialADB(ctx context.Context, svc string) (net.Conn, error) {
 		return nil, fmt.Errorf("kicked: %w", t.Error())
 	case <-t.Authenticated(): // authenticated implies connected
 	}
-	return nil, errors.ErrUnsupported // TODO
+
+	local := globalSocketAddr.Add(1)
+
+	ls := &aproto.LocalSocket{
+		Local:      local,
+		Remote:     0,
+		MaxPayload: t.aproto.MaxPayloadSize(),
+		Send:       t.send,
+	}
+	if t.SupportsFeature(adbproto.FeatureDelayedAck) {
+		ls.DelayedAck = uint32(t.server.LocalDelayedAck)
+	}
+
+	ch, remove := t.registerPendingStream(ls)
+	defer remove() // this only does something if it's still pending
+
+	if err := t.send(aproto.A_OPEN, local, ls.DelayedAck, []byte(svc+"\x00")); err != nil {
+		return nil, fmt.Errorf("send open: %w", err)
+	}
+
+	var rs *aproto.RemoteSocket
+	select {
+	case <-ctx.Done():
+	case remote := <-ch:
+		rs = remote
+	case <-t.Kicked():
+		// avoid a race condition by checking for remote again specifically
+		select {
+		default:
+			return nil, fmt.Errorf("kicked: %w", t.Error())
+		case remote := <-ch:
+			rs = remote
+		}
+	}
+	if rs == nil {
+		return nil, fmt.Errorf("connection rejected by device")
+	}
+	ls.Remote = rs.Remote
+
+	unregister := t.registerSocket(ls, rs, nil)
+
+	pair := &socketPair{
+		LS:     ls,
+		RS:     rs,
+		closed: unregister,
+	}
+	return pair, nil
 }
 
 // SupportsFeature checks whether a feature is supported by the client.It
@@ -951,14 +998,35 @@ func (t *Transport) serve(ctx context.Context) {
 
 			pair := t.findSocket(msg.Arg1, 0)
 			if pair == nil {
-				// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
-				if trace != nil && trace.PacketSocketUnknown != nil {
-					trace.PacketSocketUnknown(aproto.Packet{
-						Message: msg,
-						Payload: data,
-					})
+				if ch := t.findPendingSocket(msg.Arg1); ch != nil {
+					// first OKAY, create the connection
+					var delayedAck uint32
+					if t.SupportsFeature(adbproto.FeatureDelayedAck) && len(data) == 4 {
+						delayedAck = binary.LittleEndian.Uint32(data)
+					}
+					rs := &aproto.RemoteSocket{
+						Local:      msg.Arg1,
+						Remote:     msg.Arg0,
+						MaxPayload: t.aproto.MaxPayloadSize(),
+						DelayedAck: delayedAck,
+						Send:       t.send,
+					}
+					select {
+					case ch <- rs:
+					default:
+						// DialADB isn't waiting anymore, close it immediately
+						rs.Close()
+					}
+				} else {
+					// no matching connected or pending socket
+					if trace != nil && trace.PacketSocketUnknown != nil {
+						trace.PacketSocketUnknown(aproto.Packet{
+							Message: msg,
+							Payload: data,
+						})
+					}
 				}
-				break
+				continue
 			}
 
 			pair.rs.Handle(aproto.Packet{
@@ -978,13 +1046,23 @@ func (t *Transport) serve(ctx context.Context) {
 
 			pair := t.findSocket(msg.Arg1, msg.Arg0)
 			if pair == nil {
-				if trace != nil && trace.PacketSocketUnknown != nil {
-					trace.PacketSocketUnknown(aproto.Packet{
-						Message: msg,
-						Payload: data,
-					})
+				if ch := t.findPendingSocket(msg.Arg1); ch != nil {
+					// reject
+					select {
+					case ch <- nil:
+					default:
+						// DialADB isn't waiting anymore
+					}
+				} else {
+					// no matching connected or pending socket
+					if trace != nil && trace.PacketSocketUnknown != nil {
+						trace.PacketSocketUnknown(aproto.Packet{
+							Message: msg,
+							Payload: data,
+						})
+					}
 				}
-				goto ignore
+				continue
 			}
 
 			pair.ls.Handle(aproto.Packet{
@@ -1010,7 +1088,7 @@ func (t *Transport) serve(ctx context.Context) {
 						Payload: data,
 					})
 				}
-				goto ignore
+				continue
 			}
 
 			pair.ls.Handle(aproto.Packet{
@@ -1072,6 +1150,18 @@ func (t *Transport) findSocket(local, remote uint32) *stream {
 	return nil
 }
 
+func (t *Transport) findPendingSocket(local uint32) chan<- *aproto.RemoteSocket {
+	t.streamsMu.Lock()
+	defer t.streamsMu.Unlock()
+	for s, ch := range t.pendingStreams {
+		if s.Local == local {
+			delete(t.pendingStreams, s)
+			return ch
+		}
+	}
+	return nil
+}
+
 func (t *Transport) registerSocket(ls *aproto.LocalSocket, rs *aproto.RemoteSocket, lss net.Conn) (unregister func()) {
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
@@ -1094,6 +1184,25 @@ func (t *Transport) registerSocket(ls *aproto.LocalSocket, rs *aproto.RemoteSock
 		defer t.streamsMu.Unlock()
 
 		delete(t.streams, stream)
+	}
+}
+
+func (t *Transport) registerPendingStream(ls *aproto.LocalSocket) (remote <-chan *aproto.RemoteSocket, done func()) {
+	t.streamsMu.Lock()
+	defer t.streamsMu.Unlock()
+
+	if t.pendingStreams == nil {
+		t.pendingStreams = make(map[*aproto.LocalSocket]chan *aproto.RemoteSocket)
+	}
+
+	ch := make(chan *aproto.RemoteSocket, 1)
+	t.pendingStreams[ls] = ch
+
+	return ch, func() {
+		t.streamsMu.Lock()
+		defer t.streamsMu.Unlock()
+
+		delete(t.pendingStreams, ls)
 	}
 }
 
@@ -1241,8 +1350,9 @@ var (
 // socketPair combines a LS and a RS into a [net.Conn]. It behaves similarly to
 // a [net.TCPConn].
 type socketPair struct {
-	LS *aproto.LocalSocket
-	RS *aproto.RemoteSocket
+	LS     *aproto.LocalSocket
+	RS     *aproto.RemoteSocket
+	closed func()
 }
 
 var (
@@ -1290,6 +1400,9 @@ func (d *socketPair) CloseWrite() error {
 }
 
 func (d *socketPair) Close() error {
+	if d.closed != nil {
+		defer d.closed()
+	}
 	return errors.Join(
 		d.CloseRead(),
 		d.CloseWrite(),
