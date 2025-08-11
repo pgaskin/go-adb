@@ -9,7 +9,6 @@ import (
 	"math"
 	"net"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,35 +16,14 @@ import (
 
 // TODO: actually test delayed acks
 
-// SocketAddr is an ADB socket address, unique on the end it was created on. A
-// zero socket address is invalid.
-type SocketAddr uint32
-
-var _ net.Addr = SocketAddr(0)
-
-var globalSocketAddr atomic.Uint32
-
-// newSocketAddress allocates a new unique socket address.
-func MakeSocketAddress() SocketAddr {
-	return SocketAddr(globalSocketAddr.Add(1))
-}
-
-func (a SocketAddr) Network() string {
-	return "adb"
-}
-
-func (a SocketAddr) String() string {
-	return strconv.FormatUint(uint64(a), 10)
-}
-
 // LocalSocket is a stream which reads from the aproto client (i.e., receives
 // A_WRTE/A_CLSE packets and sends A_OKAY ones). It is safe for concurrent use.
 //
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
 type LocalSocket struct {
-	Local  SocketAddr
-	Remote SocketAddr
+	Local  uint32
+	Remote uint32
 
 	MaxPayload uint32                                                         // required
 	DelayedAck uint32                                                         // required, zero if delayed ack disabled
@@ -85,7 +63,7 @@ func (r *LocalSocket) Handle(pkt Packet) {
 	if pkt.Command != A_WRTE && pkt.Command != A_CLSE {
 		return
 	}
-	if r.Local != SocketAddr(pkt.Arg1) || r.Remote != SocketAddr(pkt.Arg0) {
+	if r.Local != pkt.Arg1 || r.Remote != pkt.Arg0 {
 		return
 	}
 
@@ -255,8 +233,8 @@ func (r *LocalSocket) Close() error {
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
 type RemoteSocket struct {
-	Local  SocketAddr
-	Remote SocketAddr
+	Local  uint32
+	Remote uint32
 
 	MaxPayload uint32                                                         // required
 	DelayedAck uint32                                                         // required, zero if delayed ack disabled
@@ -295,7 +273,7 @@ func (w *RemoteSocket) Handle(pkt Packet) {
 	if pkt.Command != A_OKAY {
 		return
 	}
-	if w.Local != SocketAddr(pkt.Arg1) || w.Remote != SocketAddr(pkt.Arg0) {
+	if w.Local != pkt.Arg1 || w.Remote != pkt.Arg0 {
 		return
 	}
 
@@ -411,113 +389,9 @@ func (w *RemoteSocket) SetDeadline(t time.Time) {
 	w.deadline.Set(t)
 }
 
-type shutdownRD interface {
-	CloseRead() error
-}
-
-type shutdownWR interface {
-	CloseWrite() error
-}
-
-var (
-	_ shutdownRD = (*net.TCPConn)(nil)
-	_ shutdownWR = (*net.TCPConn)(nil)
-)
-
-// SocketPair combines a LS and a RS into a [net.Conn]. It behaves similarly to
-// a [net.TCPConn].
-type SocketPair struct {
-	LS *LocalSocket
-	RS *RemoteSocket
-}
-
-var (
-	_ net.Conn   = (*SocketPair)(nil)
-	_ shutdownRD = (*SocketPair)(nil)
-	_ shutdownWR = (*SocketPair)(nil)
-)
-
-func (d *SocketPair) Handle(pkt Packet) {
-	if d.LS == nil || d.RS == nil || d.LS.Local != d.RS.Local || d.LS.Remote != d.RS.Remote {
-		panic("not a socket pair")
-	}
-	if pkt.Command != A_WRTE && pkt.Command != A_CLSE && pkt.Command != A_OKAY {
-		return
-	}
-	if d.LS.Local != SocketAddr(pkt.Arg1) || d.RS.Remote != SocketAddr(pkt.Arg0) {
-		return
-	}
-	switch pkt.Command {
-	case A_WRTE, A_CLSE:
-		d.LS.Handle(pkt)
-	case A_OKAY:
-		d.RS.Handle(pkt)
-	}
-}
-
-func (d *SocketPair) Read(b []byte) (n int, err error) {
-	if d.LS == nil || d.RS == nil || d.LS.Local != d.RS.Local || d.LS.Remote != d.RS.Remote {
-		panic("not a socket pair")
-	}
-	return d.LS.Read(b)
-}
-
-func (d *SocketPair) Write(b []byte) (n int, err error) {
-	if d.LS == nil || d.RS == nil || d.LS.Local != d.RS.Local || d.LS.Remote != d.RS.Remote {
-		panic("not a socket pair")
-	}
-	return d.RS.Write(b)
-}
-
-func (d *SocketPair) CloseRead() error {
-	if err := d.LS.Close(); err != nil {
-		return fmt.Errorf("local: %w", err)
-	}
-	return nil
-}
-
-func (d *SocketPair) CloseWrite() error {
-	if err := d.RS.Close(); err != nil {
-		return fmt.Errorf("remote: %w", err)
-	}
-	return nil
-}
-
-// Close immediately closes both ends of the socket.
-func (d *SocketPair) Close() error {
-	return errors.Join(
-		d.CloseRead(),
-		d.CloseWrite(),
-	)
-}
-
-func (d *SocketPair) LocalAddr() net.Addr {
-	return d.LS.Local
-}
-
-func (d *SocketPair) RemoteAddr() net.Addr {
-	return d.RS.Local
-}
-
-func (d *SocketPair) SetDeadline(t time.Time) error {
-	d.LS.SetDeadline(t)
-	d.RS.SetDeadline(t)
-	return nil
-}
-
-func (d *SocketPair) SetReadDeadline(t time.Time) error {
-	d.LS.SetDeadline(t)
-	return nil
-}
-
-func (d *SocketPair) SetWriteDeadline(t time.Time) error {
-	d.RS.SetDeadline(t)
-	return nil
-}
-
 // LocalServiceSocket runs the loop connecting a local service socket to a
 // socket pair, then closes both sockets.
-func LocalServiceSocket(p *SocketPair, lss net.Conn) error {
+func LocalServiceSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteCloser) error {
 	var (
 		readCh     = make(chan error, 1)
 		writeCh    = make(chan error, 1)
@@ -529,7 +403,7 @@ func LocalServiceSocket(p *SocketPair, lss net.Conn) error {
 		defer func() {
 			// this doesn't do anything unless the user is doing weird stuff,
 			// but let's just call it for completeness
-			err := p.LS.Close()
+			err := ls.Close()
 			if err != nil {
 				err = fmt.Errorf("close local socket: %w", err)
 			}
@@ -544,9 +418,9 @@ func LocalServiceSocket(p *SocketPair, lss net.Conn) error {
 			}
 			lssCloseCh <- err
 		}()
-		b := make([]byte, cmp.Or(p.LS.DelayedAck, p.LS.MaxPayload))
+		b := make([]byte, cmp.Or(ls.DelayedAck, ls.MaxPayload))
 		for {
-			nr, err := p.LS.Read(b)
+			nr, err := ls.Read(b)
 			if err == io.EOF {
 				// we received a CLSE from the client since they want us to go
 				// away or we closed RS and they finished reading it
@@ -573,13 +447,13 @@ func LocalServiceSocket(p *SocketPair, lss net.Conn) error {
 			// tell the client we have no more data for it, so it will finish
 			// reading, then send us a CLSE (which will make the LS EOF once we
 			// finish reading it)
-			err := p.RS.Close()
+			err := rs.Close()
 			if err != nil {
 				err = fmt.Errorf("close remote socket: %q", err)
 			}
 			rsCloseCh <- err
 		}()
-		b := make([]byte, cmp.Or(p.LS.DelayedAck, p.LS.MaxPayload))
+		b := make([]byte, cmp.Or(rs.DelayedAck, rs.MaxPayload))
 		for {
 			nr, err := lss.Read(b)
 			if err == io.EOF {
@@ -590,7 +464,7 @@ func LocalServiceSocket(p *SocketPair, lss net.Conn) error {
 				writeCh <- fmt.Errorf("read local service socket: %w", err)
 				return
 			}
-			nw, err := p.RS.Write(b[:nr])
+			nw, err := rs.Write(b[:nr])
 			if err != nil {
 				writeCh <- fmt.Errorf("write remote socket: %w", err)
 				return

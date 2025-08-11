@@ -33,6 +33,8 @@ import (
 
 var debug *slog.Logger
 
+var globalSocketAddr atomic.Uint32 // we could do it per-transport, but this is nicer for debugging
+
 func init() {
 	if v, _ := strconv.ParseBool(os.Getenv("ADBPROXY_TRACE")); v {
 		debug = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -562,7 +564,12 @@ func (t *Transport) Kick(err error) {
 		defer t.streamsMu.Unlock()
 
 		for stream := range t.streams {
-			stream.pair.Close()
+			if stream.ls != nil {
+				stream.ls.Close()
+			}
+			if stream.rs != nil {
+				stream.rs.Close()
+			}
 			if stream.lss != nil {
 				stream.lss.Close()
 			}
@@ -884,33 +891,31 @@ func (t *Transport) serve(ctx context.Context) {
 				debug.Debug("opened service")
 
 				var (
-					local  = aproto.MakeSocketAddress()
-					remote = aproto.SocketAddr(msg.Arg0)
+					local  = globalSocketAddr.Add(1)
+					remote = msg.Arg0
 				)
 
-				pair := &aproto.SocketPair{
-					LS: &aproto.LocalSocket{
-						Local:      local,
-						Remote:     remote,
-						MaxPayload: t.aproto.MaxPayloadSize(),
-						Send:       t.send,
-					},
-					RS: &aproto.RemoteSocket{
-						Local:      local,
-						Remote:     remote,
-						MaxPayload: t.aproto.MaxPayloadSize(),
-						Send:       t.send,
-					},
+				ls := &aproto.LocalSocket{
+					Local:      local,
+					Remote:     remote,
+					MaxPayload: t.aproto.MaxPayloadSize(),
+					Send:       t.send,
+				}
+				rs := &aproto.RemoteSocket{
+					Local:      local,
+					Remote:     remote,
+					MaxPayload: t.aproto.MaxPayloadSize(),
+					Send:       t.send,
 				}
 				if t.server.DelayedAck && t.SupportsFeature(adbproto.FeatureDelayedAck) {
-					pair.LS.DelayedAck = uint32(t.server.LocalDelayedAck)
-					pair.RS.DelayedAck = msg.Arg1 // the client's delayed ack (note: for the adb host daemon, ADB_BURST_MODE=1 is required to enable this)
-					debug.Debug("using delayed acks", "ls", pair.LS.DelayedAck, "rs", pair.RS.DelayedAck)
+					ls.DelayedAck = uint32(t.server.LocalDelayedAck)
+					rs.DelayedAck = msg.Arg1 // the client's delayed ack (note: for the adb host daemon, ADB_BURST_MODE=1 is required to enable this)
+					debug.Debug("using delayed acks", "ls", ls.DelayedAck, "rs", rs.DelayedAck)
 				}
-				unregister := t.registerSocket(pair, lss)
+				unregister := t.registerSocket(ls, rs, lss)
 
-				if pair.LS.DelayedAck != 0 {
-					t.write(aproto.A_OKAY, uint32(local), uint32(remote), binary.LittleEndian.AppendUint32(nil, pair.LS.DelayedAck))
+				if ls.DelayedAck != 0 {
+					t.write(aproto.A_OKAY, uint32(local), uint32(remote), binary.LittleEndian.AppendUint32(nil, ls.DelayedAck))
 				} else {
 					t.write(aproto.A_OKAY, uint32(local), uint32(remote), nil)
 				}
@@ -919,7 +924,7 @@ func (t *Transport) serve(ctx context.Context) {
 					defer debug.Debug("closed service")
 					defer unregister()
 
-					aproto.LocalServiceSocket(pair, lss)
+					aproto.LocalServiceSocket(ls, rs, lss)
 				}()
 			}
 			if t.server.LazyOpen {
@@ -938,13 +943,13 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			pair := t.findSocket(aproto.SocketAddr(msg.Arg1), 0)
+			pair := t.findSocket(msg.Arg1, 0)
 			if pair == nil {
 				// TODO: we'll need this for reverse (it'll get sent to us when we send an OPEN)
 				break
 			}
 
-			pair.Handle(aproto.Packet{
+			pair.rs.Handle(aproto.Packet{
 				Message: msg,
 				Payload: data,
 			})
@@ -959,13 +964,13 @@ func (t *Transport) serve(ctx context.Context) {
 				goto ignore
 			}
 
-			pair := t.findSocket(aproto.SocketAddr(msg.Arg1), aproto.SocketAddr(msg.Arg0))
+			pair := t.findSocket(msg.Arg1, msg.Arg0)
 			if pair == nil {
 				debug.Debug("cannot find stream to close, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
 				goto ignore
 			}
 
-			pair.Handle(aproto.Packet{
+			pair.ls.Handle(aproto.Packet{
 				Message: msg,
 				Payload: data,
 			})
@@ -980,13 +985,13 @@ func (t *Transport) serve(ctx context.Context) {
 				return
 			}
 
-			pair := t.findSocket(aproto.SocketAddr(msg.Arg1), aproto.SocketAddr(msg.Arg0))
+			pair := t.findSocket(msg.Arg1, msg.Arg0)
 			if pair == nil {
 				debug.Debug("cannot find stream to write, ignoring", "remote", msg.Arg0, "local", msg.Arg1)
 				goto ignore
 			}
 
-			pair.Handle(aproto.Packet{
+			pair.ls.Handle(aproto.Packet{
 				Message: msg,
 				Payload: data,
 			})
@@ -1021,18 +1026,18 @@ func (t *Transport) handshake(serverCert *tls.Certificate, verify func(peerCert 
 	return t.aproto.Handshake(serverCert, verify)
 }
 
-func (t *Transport) findSocket(local, remote aproto.SocketAddr) *aproto.SocketPair {
+func (t *Transport) findSocket(local, remote uint32) *stream {
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
 	for s := range t.streams {
 		if (remote == 0 || s.remote == remote) && s.local == local {
-			return s.pair
+			return s
 		}
 	}
 	return nil
 }
 
-func (t *Transport) registerSocket(pair *aproto.SocketPair, lss net.Conn) (unregister func()) {
+func (t *Transport) registerSocket(ls *aproto.LocalSocket, rs *aproto.RemoteSocket, lss net.Conn) (unregister func()) {
 	t.streamsMu.Lock()
 	defer t.streamsMu.Unlock()
 
@@ -1041,10 +1046,11 @@ func (t *Transport) registerSocket(pair *aproto.SocketPair, lss net.Conn) (unreg
 	}
 
 	stream := &stream{
-		local:  pair.LS.Local,
-		remote: pair.LS.Remote,
+		local:  ls.Local,
+		remote: ls.Remote,
+		ls:     ls,
+		rs:     rs,
 		lss:    lss,
-		pair:   pair,
 	}
 	t.streams[stream] = struct{}{}
 
@@ -1057,10 +1063,11 @@ func (t *Transport) registerSocket(pair *aproto.SocketPair, lss net.Conn) (unreg
 }
 
 type stream struct {
-	local  aproto.SocketAddr
-	remote aproto.SocketAddr
+	local  uint32
+	remote uint32
+	ls     *aproto.LocalSocket
+	rs     *aproto.RemoteSocket
 	lss    net.Conn
-	pair   *aproto.SocketPair
 }
 
 // DeviceBanner creates a banner for the specified adb server. If srv implements
@@ -1181,4 +1188,99 @@ func stripTrailingNulls(b []byte) []byte {
 		b = b[:len(b)-1]
 	}
 	return b
+}
+
+type shutdownRD interface {
+	CloseRead() error
+}
+
+type shutdownWR interface {
+	CloseWrite() error
+}
+
+var (
+	_ shutdownRD = (*net.TCPConn)(nil)
+	_ shutdownWR = (*net.TCPConn)(nil)
+)
+
+// socketPair combines a LS and a RS into a [net.Conn]. It behaves similarly to
+// a [net.TCPConn].
+type socketPair struct {
+	LS *aproto.LocalSocket
+	RS *aproto.RemoteSocket
+}
+
+var (
+	_ net.Conn   = (*socketPair)(nil)
+	_ shutdownRD = (*socketPair)(nil)
+	_ shutdownWR = (*socketPair)(nil)
+)
+
+type socketAddr uint32
+
+func (a socketAddr) Network() string {
+	return "adb"
+}
+
+func (a socketAddr) String() string {
+	return strconv.FormatUint(uint64(a), 10)
+}
+
+func (d *socketPair) Read(b []byte) (n int, err error) {
+	if d.LS == nil || d.RS == nil || d.LS.Local != d.RS.Local || d.LS.Remote != d.RS.Remote {
+		panic("not a socket pair")
+	}
+	return d.LS.Read(b)
+}
+
+func (d *socketPair) Write(b []byte) (n int, err error) {
+	if d.LS == nil || d.RS == nil || d.LS.Local != d.RS.Local || d.LS.Remote != d.RS.Remote {
+		panic("not a socket pair")
+	}
+	return d.RS.Write(b)
+}
+
+func (d *socketPair) CloseRead() error {
+	if err := d.LS.Close(); err != nil {
+		return fmt.Errorf("local: %w", err)
+	}
+	return nil
+}
+
+func (d *socketPair) CloseWrite() error {
+	if err := d.RS.Close(); err != nil {
+		return fmt.Errorf("remote: %w", err)
+	}
+	return nil
+}
+
+func (d *socketPair) Close() error {
+	return errors.Join(
+		d.CloseRead(),
+		d.CloseWrite(),
+	)
+}
+
+func (d *socketPair) LocalAddr() net.Addr {
+	return socketAddr(d.LS.Local)
+}
+
+func (d *socketPair) RemoteAddr() net.Addr {
+	return socketAddr(d.RS.Local)
+}
+
+func (d *socketPair) SetDeadline(t time.Time) error {
+	d.LS.SetDeadline(t)
+	d.RS.SetDeadline(t)
+	return nil
+}
+
+func (d *socketPair) SetReadDeadline(t time.Time) error {
+	d.LS.SetDeadline(t)
+	return nil
+}
+
+func (d *socketPair) SetWriteDeadline(t time.Time) error {
+	d.RS.SetDeadline(t)
+	return nil
 }
