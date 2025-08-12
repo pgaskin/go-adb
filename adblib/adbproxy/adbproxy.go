@@ -27,8 +27,6 @@ import (
 	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 )
 
-// TODO: implement DialADB
-
 var globalSocketAddr atomic.Uint32 // we could do it per-transport, but this is nicer for debugging
 
 var ErrServerClosed = errors.New("server closed")
