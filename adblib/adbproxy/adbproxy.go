@@ -1414,7 +1414,7 @@ func (d *socketPair) LocalAddr() net.Addr {
 }
 
 func (d *socketPair) RemoteAddr() net.Addr {
-	return socketAddr(d.RS.Local)
+	return socketAddr(d.RS.Remote)
 }
 
 func (d *socketPair) SetDeadline(t time.Time) error {
