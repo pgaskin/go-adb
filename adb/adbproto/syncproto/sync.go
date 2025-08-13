@@ -3,6 +3,7 @@ package syncproto
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 
@@ -266,4 +267,84 @@ func (r *syncDataReader) Read(p []byte) (int, error) {
 
 	// read from our buffered chunk
 	return r.buf.Read(p)
+}
+
+func SyncDataWriter(conn net.Conn, mtime int64) io.WriteCloser {
+	return &syncDataWriter{
+		conn:  conn,
+		mtime: mtime,
+	}
+}
+
+type syncDataWriter struct {
+	conn  net.Conn
+	mtime int64
+	buf   bytes.Buffer
+	err   error
+}
+
+// TODO: simplify this logic (it's probably simpler not to use a bytes.Buffer)
+
+func (r *syncDataWriter) Write(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	var total int
+	for len(p) != 0 {
+		if r.buf.Len() == 0 {
+			r.buf.Write(Packet_DATA[:])
+			r.buf.Write(make([]byte, 4))
+		}
+		if r.buf.Len() < 8 {
+			panic("wtf")
+		}
+		room := SyncDataMax + 8 - r.buf.Len()
+		n := min(len(p), room)
+		r.buf.Write(p[:n])
+		p = p[n:]
+		if n == room {
+			if err := r.flush(); err != nil {
+				return total, err
+			}
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func (r *syncDataWriter) flush() error {
+	if r.err != nil {
+		return r.err
+	}
+	if r.buf.Len() == 0 {
+		return nil
+	}
+	if r.buf.Len() < 8 {
+		panic("wtf")
+	}
+	if r.buf.Len() > SyncDataMax+8 {
+		panic("wtf")
+	}
+	b := r.buf.Bytes()
+	binary.LittleEndian.PutUint32(b[4:8], uint32(r.buf.Len()-8))
+	if _, err := r.conn.Write(b); err != nil {
+		r.err = err
+		return r.err
+	}
+	r.buf.Reset()
+	return nil
+}
+
+func (r *syncDataWriter) Close() error {
+	if err := r.flush(); err != nil {
+		return err
+	}
+	r.buf.Write(Packet_DONE[:])
+	r.buf.Write(binary.LittleEndian.AppendUint32(r.buf.AvailableBuffer(), uint32(r.mtime)))
+	if _, err := r.conn.Write(r.buf.Bytes()); err != nil {
+		r.err = err
+		return r.err
+	}
+	r.err = errors.New("sync data writer closed")
+	return nil
 }
