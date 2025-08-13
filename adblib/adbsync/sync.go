@@ -10,6 +10,7 @@ import (
 	"net"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -422,15 +423,15 @@ func (c *Client) Open(name string) (io.ReadCloser, error) {
 
 // Create opens a writer to the specified file. The error for the [io.Closer]
 // must be checked to ensure the file was read successfully.
-func (c *Client) Create(name string, mode FileMode) (io.WriteCloser, error) {
+func (c *Client) Create(name string, mode FileMode, mtime time.Time) (io.WriteCloser, error) {
 	conn, err := c.getConn()
 	if err != nil {
 		return nil, err
 	}
 	if c.srv2 == nil {
-		return conn.Send1(name, mode)
+		return conn.Send1(name, mode, mtime)
 	}
-	return conn.Send2(name, mode)
+	return conn.Send2(name, mode, mtime)
 }
 
 // ReadFile reads the specified file and returns the contents.
@@ -450,7 +451,7 @@ func (c *Client) ReadFile(name string) ([]byte, error) {
 
 // WriteFile writes data to the specified file, creating it if necessary.
 func (c *Client) WriteFile(name string, data []byte, mode FileMode) error {
-	f, err := c.Create(name, mode)
+	f, err := c.Create(name, mode, time.Now())
 	if err != nil {
 		return err
 	}
@@ -735,12 +736,68 @@ func (c *syncConn) List2(name string) ([]DirEntry, error) {
 	return de, nil
 }
 
-func (c *syncConn) Send1(name string, mode FileMode) (io.WriteCloser, error) {
-	return nil, errors.ErrUnsupported // TODO
+func (c *syncConn) Send1(name string, mode FileMode, mtime time.Time) (io.WriteCloser, error) {
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_SEND_V1, name+","+strconv.FormatUint(uint64(syncFileMode(mode)), 10)); err != nil {
+		c.abort(err, "send_v1 request protocol error")
+		return nil, &PathError{
+			Op:   "send_v1",
+			Path: name,
+			Err:  err,
+		}
+	}
+	w := &syncConnFileWriter{
+		name: name,
+		op:   "send_v1",
+		conn: c,
+		w:    syncproto.SyncDataWriter(c.conn, mtime.Unix()),
+		r:    make(chan error),
+	}
+	go w.readResult()
+	return w, nil
 }
 
-func (c *syncConn) Send2(name string, mode FileMode) (io.WriteCloser, error) {
-	return nil, errors.ErrUnsupported // TODO
+func (c *syncConn) Send2(name string, mode FileMode, mtime time.Time) (io.WriteCloser, error) {
+	if err := syncproto.SyncRequest(c.conn, syncproto.Packet_SEND_V2, name); err != nil {
+		c.abort(err, "send_v2 request protocol error")
+		return nil, &PathError{
+			Op:   "send_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	if err := syncproto.SyncRequestObject(c.conn, syncproto.Packet_SEND_V2, syncproto.SyncSend2{
+		Mode:  syncFileMode(mode),
+		Flags: c.compress.syncFlag(),
+	}); err != nil {
+		c.abort(err, "send_v2 request protocol error")
+		return nil, &PathError{
+			Op:   "send_v2",
+			Path: name,
+			Err:  err,
+		}
+	}
+	w := &syncConnFileWriter{
+		name: name,
+		op:   "send_v2_" + string(c.compress),
+		conn: c,
+		w:    syncproto.SyncDataWriter(c.conn, mtime.Unix()),
+		r:    make(chan error),
+	}
+	if c.compress != compressionMethodNone {
+		cmp, err := c.compressionConfig.compress(c.compress, w.w)
+		if err != nil {
+			c.abort(err, "send_v2 compression error")
+			return nil, &PathError{
+				Op:   "send_v2",
+				Path: name,
+				Err:  err,
+			}
+		}
+		w.c2 = w.w
+		w.w = cmp
+	}
+	go w.readResult()
+	return w, nil
 }
 
 func (c *syncConn) Recv1(name string) (io.ReadCloser, error) {
@@ -859,6 +916,9 @@ func (r *syncConnFileReader) Read(p []byte) (int, error) {
 }
 
 func (r *syncConnFileReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.r != nil {
 		_ = r.r.Close() // ignore errors from a decompressor
 	}
@@ -868,4 +928,61 @@ func (r *syncConnFileReader) Close() error {
 		r.conn = nil
 	}
 	return nil
+}
+
+type syncConnFileWriter struct {
+	name string
+	op   string
+	mu   sync.Mutex
+	conn *syncConn
+	c2   io.Closer
+	w    io.WriteCloser
+	r    chan error
+	err  error
+}
+
+func (w *syncConnFileWriter) readResult() {
+	w.r <- syncproto.SyncResponse(w.conn.conn)
+}
+
+func (w *syncConnFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.err != nil {
+		return 0, w.err
+	}
+	if w.conn == nil {
+		return 0, net.ErrClosed
+	}
+	return w.w.Write(p)
+}
+
+func (w *syncConnFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.w != nil {
+		err := w.w.Close()
+		if w.err == nil {
+			w.err = err
+		}
+	}
+	if w.c2 != nil {
+		err := w.c2.Close()
+		if w.err == nil {
+			w.err = err
+		}
+	}
+	if w.conn != nil {
+		if w.err == nil {
+			w.err = <-w.r // TODO: timeout?
+		}
+		if w.err != nil {
+			w.conn.abort(net.ErrClosed, "send error: "+w.err.Error())
+		}
+		w.conn.client.putConn(w.conn)
+		w.conn = nil
+	}
+	return w.err
 }
