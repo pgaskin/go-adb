@@ -783,7 +783,7 @@ func (c *syncConn) Send2(name string, mode FileMode, mtime time.Time) (io.WriteC
 		w:    syncproto.SyncDataWriter(c.conn, mtime.Unix()),
 		r:    make(chan error),
 	}
-	if c.compress != compressionMethodNone {
+	if c.compress != compressionMethodNone && mode.Type() != fs.ModeSymlink {
 		cmp, err := c.compressionConfig.compress(c.compress, w.w)
 		if err != nil {
 			c.abort(err, "send_v2 compression error")
