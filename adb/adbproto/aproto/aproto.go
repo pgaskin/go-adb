@@ -409,7 +409,7 @@ func (c *Conn) Write(cmd Command, arg0, arg1 uint32, data []byte) bool {
 		Payload: data,
 	}
 	if len(data) == 0 {
-		if buf, err := pkt.Message.AppendBinary(c.wmsg[:]); err != nil {
+		if buf, err := pkt.Message.AppendBinary(c.wmsg[:0]); err != nil {
 			c.setError(fmt.Errorf("write: %w", err))
 			return false
 		} else if _, err := c.rw.Write(buf); err != nil {
@@ -423,7 +423,7 @@ func (c *Conn) Write(cmd Command, arg0, arg1 uint32, data []byte) bool {
 			if c.ProtocolVersion() < VersionSkipChecksum {
 				pkt.DataCheck = Checksum(pkt.Payload)
 			}
-			if buf, err := pkt.Message.AppendBinary(c.wmsg[:]); err != nil {
+			if buf, err := pkt.Message.AppendBinary(c.wmsg[:0]); err != nil {
 				c.setError(fmt.Errorf("write: %w", err))
 				return false
 			} else if _, err := c.rw.Write(buf); err != nil {
