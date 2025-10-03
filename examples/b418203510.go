@@ -10,6 +10,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,7 +27,7 @@ import (
 	"github.com/pgaskin/go-adb/adb/adbhost"
 	"github.com/pgaskin/go-adb/adb/adbproto"
 	"github.com/pgaskin/go-adb/adb/adbproto/shellproto2"
-	"github.com/pgaskin/go-adb/adblib/adbexec"
+	"github.com/pgaskin/go-adb/adblib/adbexec/v2"
 	"github.com/pgaskin/go-adb/adblib/adbproxy"
 	"github.com/pgaskin/go-adb/adblib/adbsync"
 )
@@ -38,7 +39,9 @@ var (
 	Arch   = flag.String("arch", "arm64", "goarch for android device") // we could detect this, but this is just a quick PoC
 )
 
-const src = `
+var testBytes, echoBytes = []byte{'O', 'K', '\n', '\x00', '\xFF'}, 64
+
+var src = `
 package main
 
 import (
@@ -48,7 +51,26 @@ import (
 	"os"
 )
 
+var testBytes, echoBytes = ` + fmt.Sprintf("%#v, %#v", testBytes, echoBytes) + `
+
 func main() {
+	if os.Args[1] == "!test" {
+		b := make([]byte, echoBytes)
+		if _, err := os.Stdout.Write(testBytes); err != nil {
+			fmt.Fprintf(os.Stderr, "write test bytes: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := io.ReadFull(os.Stdin, b); err != nil {
+			fmt.Fprintf(os.Stderr, "read echo bytes: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := os.Stdout.Write(b); err != nil {
+			fmt.Fprintf(os.Stderr, "write echo bytes: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	conn, err := net.Dial("unix", os.Args[1])
 	if err != nil {
 		fmt.Printf("E%v", err)
@@ -149,6 +171,11 @@ func NewSocketInterceptDialer(ctx context.Context, dev adb.Dialer, arch string) 
 		return nil, fmt.Errorf("failed to push connect helper: %w", err)
 	}
 
+	slog.Info("testing connect helper")
+	if err := testConnect(ctx, dev, bin); err != nil {
+		return nil, fmt.Errorf("connect helper is broken: %w", err)
+	}
+
 	if err := adb.SupportsFeature(dev, adbproto.FeatureShell2); err != nil {
 		return nil, err // needed since shell v1 raw mode isn't actually raw
 	}
@@ -183,6 +210,35 @@ func buildConnect(ctx context.Context, arch string) ([]byte, error) {
 		return nil, fmt.Errorf("command %q failed: %w", cmd.Args, err)
 	}
 	return os.ReadFile(tb)
+}
+
+func testConnect(ctx context.Context, dev adb.Dialer, bin string) error {
+	exp := make([]byte, len(testBytes)+echoBytes)
+	copy(exp, testBytes)
+	rand.Read(exp[len(testBytes):])
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
+	defer cancel()
+
+	cmd := adbexec.CommandContext(ctx, dev, bin, "!test")
+	cmd.Stdin = bytes.NewReader(exp[len(testBytes):])
+
+	out, err := cmd.Output()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("command did not finish in time (output: %q)", out)
+		}
+		var xx *adbexec.ExitError
+		if errors.As(err, &xx) {
+			return fmt.Errorf("%w (stderr: %q)", err, xx.Stderr)
+		}
+		return err
+	}
+
+	if !bytes.Equal(exp, out) {
+		return fmt.Errorf("wrong output: wanted %q, got %q", exp, out)
+	}
+	return nil
 }
 
 func (d *socketInterceptDialer) DialADB(ctx context.Context, svc string) (net.Conn, error) {
