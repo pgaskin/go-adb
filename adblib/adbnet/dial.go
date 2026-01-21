@@ -73,9 +73,9 @@ func Service(network, address string) (string, error) {
 			}
 			switch {
 			case network == "tcp4" && addr.Is4():
-				// ok
+				host = addr.String()
 			case network == "tcp6" && addr.Is6():
-				// ok
+				host = "[" + addr.String() + "]"
 			default:
 				return "", fmt.Errorf("wrong address type for network")
 			}
@@ -87,7 +87,7 @@ func Service(network, address string) (string, error) {
 		if host == "localhost" {
 			svc = "tcp:" + strconv.Itoa(portnum)
 		} else {
-			svc = "tcp:" + strconv.Itoa(portnum) + ":" + host
+			svc = "tcp:" + host + ":" + strconv.Itoa(portnum)
 		}
 		return svc, nil
 	case "unix":
