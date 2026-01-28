@@ -429,9 +429,9 @@ func (c *Client) Create(name string, mode FileMode, mtime time.Time) (io.WriteCl
 		return nil, err
 	}
 	if c.srv2 == nil {
-		return conn.Send1(name, mode, mtime)
+		return conn.Send2(name, mode, mtime)
 	}
-	return conn.Send2(name, mode, mtime)
+	return conn.Send1(name, mode, mtime)
 }
 
 // ReadFile reads the specified file and returns the contents.
