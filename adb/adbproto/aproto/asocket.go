@@ -256,7 +256,7 @@ func (w *RemoteSocket) initLocked() {
 		panic("remote socket missing required fields")
 	}
 	if w.notify == nil {
-		w.notify = make(chan struct{})
+		w.notify = make(chan struct{}, 1)
 		if w.DelayedAck != 0 {
 			w.asb = int32(w.DelayedAck)
 		} else {
