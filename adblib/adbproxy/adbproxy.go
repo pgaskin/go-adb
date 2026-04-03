@@ -489,7 +489,7 @@ func (t *Transport) RemoteAddr() net.Addr {
 func (t *Transport) Idle() bool {
 	t.streamsMu.Lock()
 	n := len(t.streams)
-	t.stateMu.Unlock()
+	t.streamsMu.Unlock()
 	return n == 0
 }
 
