@@ -2,6 +2,7 @@ package adbsync
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/fs"
 )
@@ -21,7 +22,7 @@ var (
 
 // FS implements [io/fs.FS] for an ADB device.
 func FS(c *Client) fs.FS {
-	return &fsImpl{c}
+	return &fsImpl{c: c}
 }
 
 func (f *fsImpl) transform(op, name string) (string, error) {
@@ -43,7 +44,7 @@ func (f *fsImpl) Stat(name string) (fs.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := f.c.Lstat(name)
+	r, err := f.c.Lstat(context.Background(), name)
 	if err != nil {
 		if err, ok := err.(*PathError); ok {
 			err.Path = name
@@ -57,7 +58,7 @@ func (f *fsImpl) ReadDir(name string) ([]fs.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := f.c.ReadDir(name)
+	r, err := f.c.ReadDir(context.Background(), name)
 	if err != nil {
 		if err, ok := err.(*PathError); ok {
 			err.Path = name
@@ -71,7 +72,7 @@ func (f *fsImpl) ReadFile(name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := f.c.ReadFile(name)
+	r, err := f.c.ReadFile(context.Background(), name)
 	if err != nil {
 		if err, ok := err.(*PathError); ok {
 			err.Path = name
@@ -102,8 +103,8 @@ func (f *fsImpl) Open(name string) (fs.File, error) {
 	// supports that, so we'll just check if it's a symlink and error in that
 	// case for the operations which depend on it (reading the file doesn't, so
 	// we won't unnecessarily error there)
-	if f.c.featuresOnce.Do(f.c.onceFeatures); f.c.statv2 == nil {
-		ff.fi, err = f.c.Stat(name) // open follows symlinks (see golang.org/issue/45470)
+	if f.c.initOnce.Do(f.c.init); f.c.statv2 == nil {
+		ff.fi, err = f.c.Stat(context.Background(), name) // open follows symlinks (see golang.org/issue/45470)
 		if err != nil {
 			if err, ok := err.(*PathError); ok {
 				err.Path = name
@@ -111,7 +112,7 @@ func (f *fsImpl) Open(name string) (fs.File, error) {
 			return nil, err
 		}
 	} else {
-		ff.fi, err = f.c.Lstat(name)
+		ff.fi, err = f.c.Lstat(context.Background(), name)
 		if err != nil {
 			if err, ok := err.(*PathError); ok {
 				err.Path = name
@@ -121,7 +122,7 @@ func (f *fsImpl) Open(name string) (fs.File, error) {
 	}
 	ff.fm = ff.fi.Mode()
 	if ff.fm&fs.ModeDir == 0 {
-		ff.fr, err = f.c.Open(name)
+		ff.fr, err = f.c.Open(context.Background(), name)
 		if err != nil && ff.fm&fs.ModeSymlink != 0 {
 			//	- if we got a symlink, it's from lstat since stat_v2 wasn't supported
 			//	- the symlink could point to a directory or file
@@ -179,7 +180,7 @@ func (f *fsFileImpl) ReadDir(n int) ([]fs.DirEntry, error) {
 		}
 	}
 	if f.de == nil {
-		de, err := f.fs.c.ReadDir(f.name)
+		de, err := f.fs.c.ReadDir(context.Background(), f.name)
 		if err != nil {
 			if err, ok := err.(*PathError); ok {
 				err.Path = f.name
