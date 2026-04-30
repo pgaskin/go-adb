@@ -83,7 +83,7 @@ func defaultCompress(method CompressionMethod, w io.Writer) (io.WriteCloser, err
 	case CompressionMethodLZ4:
 		return lz4.NewWriter(w), nil
 	case CompressionMethodZstd:
-		return zstd.NewWriter(w)
+		return zstd.NewWriter(w, zstd.WithZeroFrames(true)) // as of 2026-04-30, without WithZeroFrames, it will hang when writing a zero-length file since it's waiting for the first frame
 	default:
 		return nil, fmt.Errorf("%w: unsupported compression method %q", errors.ErrUnsupported, method)
 	}
