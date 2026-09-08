@@ -691,6 +691,21 @@ func (c *syncConn) abort(err error, reason string) {
 	c.conn.Close()
 }
 
+// responseObject reads a sync response object of type T (or nil if DONE), or
+// aborts the connection and returns a [PathError] wrapping the error.
+func (c *syncConn) responseObject[T any](id syncproto.PacketID, op, name string) (*T, error) {
+	obj, err := syncproto.SyncResponseObject[T](c.conn, id)
+	if err != nil {
+		c.abort(err, op+" response protocol error")
+		return nil, &PathError{
+			Op:   op,
+			Path: name,
+			Err:  maybeSyncFailError(err),
+		}
+	}
+	return obj, nil
+}
+
 // UseDone makes ctx's cancellation/deadline close the abort the connection if
 // finished before the returned function is called. The returned function must
 // be called to avoid leaking goroutines.
@@ -726,14 +741,9 @@ func (c *syncConn) Lstat1(name string) (FileInfo, error) {
 			Err:  err,
 		}
 	}
-	st, err := syncproto.SyncResponseObject[syncproto.SyncStat1](c.conn, syncproto.Packet_LSTAT_V1)
+	st, err := c.responseObject[syncproto.SyncStat1](syncproto.Packet_LSTAT_V1, "lstat_v1", name)
 	if err != nil {
-		c.abort(err, "lstat_v1 response protocol error")
-		return nil, &PathError{
-			Op:   "lstat_v1",
-			Path: name,
-			Err:  maybeSyncFailError(err),
-		}
+		return nil, err
 	}
 	if *st == (syncproto.SyncStat1{}) {
 		// connection is still usable; we have a response
@@ -760,14 +770,9 @@ func (c *syncConn) Lstat2(name string) (FileInfo, error) {
 			Err:  err,
 		}
 	}
-	st, err := syncproto.SyncResponseObject[syncproto.SyncStat2](c.conn, syncproto.Packet_LSTAT_V2)
+	st, err := c.responseObject[syncproto.SyncStat2](syncproto.Packet_LSTAT_V2, "lstat_v2", name)
 	if err != nil {
-		c.abort(err, "lstat_v2 response protocol error")
-		return nil, &PathError{
-			Op:   "lstat_v2",
-			Path: name,
-			Err:  maybeSyncFailError(err),
-		}
+		return nil, err
 	}
 	if st.Error != 0 {
 		return nil, &PathError{
@@ -793,14 +798,9 @@ func (c *syncConn) Stat2(name string) (FileInfo, error) {
 			Err:  err,
 		}
 	}
-	st, err := syncproto.SyncResponseObject[syncproto.SyncStat2](c.conn, syncproto.Packet_STAT_V2)
+	st, err := c.responseObject[syncproto.SyncStat2](syncproto.Packet_STAT_V2, "stat_v2", name)
 	if err != nil {
-		c.abort(err, "lstat_v2 response protocol error")
-		return nil, &PathError{
-			Op:   "stat_v2",
-			Path: name,
-			Err:  maybeSyncFailError(err),
-		}
+		return nil, err
 	}
 	if st.Error != 0 {
 		return nil, &PathError{
@@ -828,14 +828,9 @@ func (c *syncConn) List1(name string) ([]DirEntry, error) {
 	}
 	var de []DirEntry
 	for {
-		st, err := syncproto.SyncResponseObject[syncproto.SyncDent1](c.conn, syncproto.Packet_DENT_V1)
+		st, err := c.responseObject[syncproto.SyncDent1](syncproto.Packet_DENT_V1, "list_v1_dent", name)
 		if err != nil {
-			c.abort(err, "list_v1 response protocol error")
-			return nil, &PathError{
-				Op:   "list_v1_dent",
-				Path: name,
-				Err:  maybeSyncFailError(err),
-			}
+			return nil, err
 		}
 		if st == nil {
 			break
@@ -880,14 +875,9 @@ func (c *syncConn) List2(name string) ([]DirEntry, error) {
 	}
 	var de []DirEntry
 	for {
-		st, err := syncproto.SyncResponseObject[syncproto.SyncDent2](c.conn, syncproto.Packet_DENT_V2)
+		st, err := c.responseObject[syncproto.SyncDent2](syncproto.Packet_DENT_V2, "list_v2_dent", name)
 		if err != nil {
-			c.abort(err, "list_v2 response protocol error")
-			return nil, &PathError{
-				Op:   "list_v2_dent",
-				Path: name,
-				Err:  maybeSyncFailError(err),
-			}
+			return nil, err
 		}
 		if st == nil {
 			break
