@@ -44,8 +44,7 @@ func (c *Connection) WatchEvents(
 		Modifiers:     modifiers,
 	}
 
-	var id EventRequestID
-	err := c.get(cmdEventRequestSet, req, &id)
+	id, err := c.get[EventRequestID](cmdEventRequestSet, req)
 	if err != nil {
 		return err
 	}
@@ -86,7 +85,7 @@ run: // Consume events until the handler returns false or the context is cancell
 		ID:   id,
 	}
 
-	if err := c.get(cmdEventRequestClear, clear, nil); err != nil {
+	if err := c.exec(cmdEventRequestClear, clear); err != nil {
 		return err
 	}
 

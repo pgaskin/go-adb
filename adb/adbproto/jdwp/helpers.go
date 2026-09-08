@@ -60,18 +60,36 @@ func (c *Connection) GetClassMethod(class ClassID, name, signature string) (Meth
 	return *method, nil
 }
 
+// watchEvents is like [Connection.WatchEvents], but only calls handler for
+// events of type T. Events of any other type are ignored.
+func (c *Connection) watchEvents[T Event](
+	ctx context.Context,
+	kind EventKind,
+	suspendPolicy SuspendPolicy,
+	handler func(T) bool,
+	modifiers ...EventModifier) error {
+
+	return c.WatchEvents(ctx, kind, suspendPolicy, func(event Event) bool {
+		e, ok := event.(T)
+		if !ok {
+			return true // not the event we asked for, keep waiting
+		}
+		return handler(e)
+	}, modifiers...)
+}
+
 // WaitForClassPrepare blocks until a class with a name that matches the pattern
 // is prepared, and then returns the thread that prepared the class.
 // All threads are suspended when the method returns.
 func (c *Connection) WaitForClassPrepare(ctx context.Context, pattern string) (ThreadID, error) {
 	var out ThreadID
 
-	onEvent := func(event Event) bool {
-		out = event.(*EventClassPrepare).Thread
+	onEvent := func(event *EventClassPrepare) bool {
+		out = event.Thread
 		return false
 	}
 
-	err := c.WatchEvents(ctx, ClassPrepare, SuspendAll, onEvent, ClassMatchEventModifier(pattern))
+	err := c.watchEvents(ctx, ClassPrepare, SuspendAll, onEvent, ClassMatchEventModifier(pattern))
 	if err != nil {
 		return 0, err
 	}
@@ -85,17 +103,16 @@ func (c *Connection) WaitForClassPrepare(ctx context.Context, pattern string) (T
 func (c *Connection) WaitForMethodEntry(ctx context.Context, class ClassID, method MethodID) (*EventMethodEntry, error) {
 	var out *EventMethodEntry
 
-	onEvent := func(event Event) bool {
-		e := event.(*EventMethodEntry)
-		if e.Location.Method == method {
-			out = e
+	onEvent := func(event *EventMethodEntry) bool {
+		if event.Location.Method == method {
+			out = event
 			return false
 		}
 		c.ResumeAll()
 		return true
 	}
 
-	err := c.WatchEvents(ctx, MethodEntry, SuspendAll, onEvent, ClassOnlyEventModifier(class))
+	err := c.watchEvents(ctx, MethodEntry, SuspendAll, onEvent, ClassOnlyEventModifier(class))
 	if err != nil {
 		return nil, err
 	}

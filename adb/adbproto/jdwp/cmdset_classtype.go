@@ -22,9 +22,7 @@ type InvokeResult struct {
 
 // GetSuperClass returns the immediate super class of the specified class.
 func (c *Connection) GetSuperClass(class ClassID) (ClassID, error) {
-	var res ClassID
-	err := c.get(cmdClassTypeSuperclass, class, &res)
-	return res, err
+	return c.get[ClassID](cmdClassTypeSuperclass, class)
 }
 
 // InvokeStaticMethod invokes the specified static method.
@@ -36,9 +34,7 @@ func (c *Connection) InvokeStaticMethod(class ClassID, method MethodID, thread T
 		Args    []Value
 		Options InvokeOptions
 	}{class, thread, method, args, options}
-	var res InvokeResult
-	err := c.get(cmdClassTypeInvokeMethod, req, &res)
-	return res, err
+	return c.get[InvokeResult](cmdClassTypeInvokeMethod, req)
 }
 
 // NewInstanceResult holds the return values for a constructor invokation.
@@ -56,7 +52,5 @@ func (c *Connection) NewInstance(class ClassID, constructor MethodID, thread Thr
 		Args        []Value
 		Options     InvokeOptions
 	}{class, thread, constructor, args, options}
-	var res NewInstanceResult
-	err := c.get(cmdClassTypeNewInstance, req, &res)
-	return res, err
+	return c.get[NewInstanceResult](cmdClassTypeNewInstance, req)
 }

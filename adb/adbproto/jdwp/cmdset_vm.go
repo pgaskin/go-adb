@@ -25,9 +25,7 @@ type Version struct {
 
 // GetVersion returns the JDWP version from the server.
 func (c *Connection) GetVersion() (Version, error) {
-	res := Version{}
-	err := c.get(cmdVirtualMachineVersion, struct{}{}, &res)
-	return res, err
+	return c.get[Version](cmdVirtualMachineVersion, struct{}{})
 }
 
 // ClassInfo describes a loaded classes matching the requested signature.
@@ -46,12 +44,11 @@ func (c ClassInfo) ClassID() ClassID {
 // GetClassesBySignature returns all the loaded classes matching the requested
 // signature from the server.
 func (c *Connection) GetClassesBySignature(signature string) ([]ClassInfo, error) {
-	res := []struct {
+	res, err := c.get[[]struct {
 		Kind   TypeTag
 		TypeID ReferenceTypeID
 		Status ClassStatus
-	}{}
-	err := c.get(cmdVirtualMachineClassesBySignature, &signature, &res)
+	}](cmdVirtualMachineClassesBySignature, &signature)
 	out := make([]ClassInfo, len(res))
 	for i, c := range res {
 		out[i] = ClassInfo{c.Kind, c.TypeID, signature, c.Status}
@@ -61,16 +58,12 @@ func (c *Connection) GetClassesBySignature(signature string) ([]ClassInfo, error
 
 // GetAllClasses returns all the active threads by ID.
 func (c *Connection) GetAllClasses() ([]ClassInfo, error) {
-	res := []ClassInfo{}
-	err := c.get(cmdVirtualMachineAllClasses, struct{}{}, &res)
-	return res, err
+	return c.get[[]ClassInfo](cmdVirtualMachineAllClasses, struct{}{})
 }
 
 // GetAllThreads returns all the active threads by ID.
 func (c *Connection) GetAllThreads() ([]ThreadID, error) {
-	res := []ThreadID{}
-	err := c.get(cmdVirtualMachineAllThreads, struct{}{}, &res)
-	return res, err
+	return c.get[[]ThreadID](cmdVirtualMachineAllThreads, struct{}{})
 }
 
 // IDSizes describes the sizes of all the variably sized data types.
@@ -84,19 +77,17 @@ type IDSizes struct {
 
 // GetIDSizes returns the sizes of all the variably sized data types.
 func (c *Connection) GetIDSizes() (IDSizes, error) {
-	res := IDSizes{}
-	err := c.get(cmdVirtualMachineIDSizes, struct{}{}, &res)
-	return res, err
+	return c.get[IDSizes](cmdVirtualMachineIDSizes, struct{}{})
 }
 
 // SuspendAll suspends all threads.
 func (c *Connection) SuspendAll() error {
-	return c.get(cmdVirtualMachineSuspend, struct{}{}, nil)
+	return c.exec(cmdVirtualMachineSuspend, struct{}{})
 }
 
 // ResumeAll resumes all threads.
 func (c *Connection) ResumeAll() error {
-	return c.get(cmdVirtualMachineResume, struct{}{}, nil)
+	return c.exec(cmdVirtualMachineResume, struct{}{})
 }
 
 // ResumeAllExcept resumes all threads except for the specified thread.
@@ -109,7 +100,5 @@ func (c *Connection) ResumeAllExcept(thread ThreadID) error {
 
 // CreateString returns the StringID for the given string.
 func (c *Connection) CreateString(str string) (StringID, error) {
-	res := StringID(0)
-	err := c.get(cmdVirtualMachineCreateString, str, &res)
-	return res, err
+	return c.get[StringID](cmdVirtualMachineCreateString, str)
 }

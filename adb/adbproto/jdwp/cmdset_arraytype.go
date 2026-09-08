@@ -20,7 +20,5 @@ func (c *Connection) NewArray(ty ArrayTypeID, length int) (TaggedObjectID, error
 		Ty     ArrayTypeID
 		Length int
 	}{ty, length}
-	var res TaggedObjectID
-	err := c.get(cmdArrayTypeNewInstance, req, &res)
-	return res, err
+	return c.get[TaggedObjectID](cmdArrayTypeNewInstance, req)
 }

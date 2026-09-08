@@ -16,30 +16,27 @@ package jdwp
 
 // GetThreadName returns a thread's name.
 func (c *Connection) GetThreadName(id ThreadID) (string, error) {
-	var res string
-	err := c.get(cmdThreadReferenceName, id, &res)
-	return res, err
+	return c.get[string](cmdThreadReferenceName, id)
 }
 
 // Suspend suspends the specified thread.
 func (c *Connection) Suspend(id ThreadID) error {
-	var res struct{}
-	return c.get(cmdThreadReferenceSuspend, id, &res)
+	_, err := c.get[struct{}](cmdThreadReferenceSuspend, id)
+	return err
 }
 
 // Resume resumes the specified thread.
 func (c *Connection) Resume(id ThreadID) error {
-	var res struct{}
-	return c.get(cmdThreadReferenceResume, id, &res)
+	_, err := c.get[struct{}](cmdThreadReferenceResume, id)
+	return err
 }
 
 // GetThreadStatus returns the status of the thread.
 func (c *Connection) GetThreadStatus(id ThreadID) (ThreadStatus, SuspendStatus, error) {
-	var res struct {
+	res, err := c.get[struct {
 		T ThreadStatus
 		S SuspendStatus
-	}
-	err := c.get(cmdThreadReferenceStatus, id, &res)
+	}](cmdThreadReferenceStatus, id)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -49,8 +46,7 @@ func (c *Connection) GetThreadStatus(id ThreadID) (ThreadStatus, SuspendStatus, 
 // GetSuspendCount returns the number of times the thread has been suspended
 // without a corresponding resume.
 func (c *Connection) GetSuspendCount(id ThreadID) (int, error) {
-	var count int
-	err := c.get(cmdThreadReferenceSuspendCount, id, &count)
+	count, err := c.get[int](cmdThreadReferenceSuspendCount, id)
 	if err != nil {
 		return 0, err
 	}
@@ -69,7 +65,5 @@ func (c *Connection) GetFrames(thread ThreadID, start, count int) ([]FrameInfo, 
 		Thread       ThreadID
 		Start, Count int
 	}{thread, start, count}
-	var res []FrameInfo
-	err := c.get(cmdThreadReferenceFrames, req, &res)
-	return res, err
+	return c.get[[]FrameInfo](cmdThreadReferenceFrames, req)
 }

@@ -113,17 +113,30 @@ func expect(conn io.Reader, expected []byte) (bool, error) {
 	return true, nil
 }
 
-// get sends the specified command and waits for a reply.
-func (c *Connection) get(cmd cmd, req interface{}, out interface{}) error {
+// get sends the specified command and waits for a reply of type T.
+func (c *Connection) get[T any](cmd cmd, req any) (T, error) {
+	var out T
+	p, err := c.req(cmd, req)
+	if err != nil {
+		return out, err
+	}
+	if err := p.wait(&out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// exec sends the specified command and waits for a reply without any data.
+func (c *Connection) exec(cmd cmd, req any) error {
 	p, err := c.req(cmd, req)
 	if err != nil {
 		return err
 	}
-	return p.wait(out)
+	return p.wait(nil)
 }
 
 // req sends the specified command and returns a pending.
-func (c *Connection) req(cmd cmd, req interface{}) (*pending, error) {
+func (c *Connection) req(cmd cmd, req any) (*pending, error) {
 	data := bytes.Buffer{}
 	if req != nil {
 		e := ByteOrderWriter(&data, BigEndian)
@@ -157,9 +170,9 @@ type pending struct {
 	id packetID
 }
 
-// wait blocks until the penging response is received, filling out with the
-// response data.
-func (p *pending) wait(out interface{}) error {
+// wait blocks until the pending response is received, filling out with the
+// response data. If out is nil, the response data is discarded.
+func (p *pending) wait(out any) error {
 	select {
 	case reply := <-p.p:
 		if reply.err != ErrNone {

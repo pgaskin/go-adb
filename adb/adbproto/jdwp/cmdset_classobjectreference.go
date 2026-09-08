@@ -19,10 +19,9 @@ func (c *Connection) ReflectedType(id ClassObjectID) (ReferenceTypeID, error) {
 	req := struct {
 		ID ClassObjectID
 	}{id}
-	var res struct {
+	res, err := c.get[struct {
 		Kind byte
 		ID   ReferenceTypeID
-	}
-	err := c.get(cmdClassObjectReferenceReflectedType, req, &res)
+	}](cmdClassObjectReferenceReflectedType, req)
 	return res.ID, err
 }

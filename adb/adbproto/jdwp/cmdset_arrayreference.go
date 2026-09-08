@@ -16,9 +16,7 @@ package jdwp
 
 // GetArrayLength returns the length of the specified array.
 func (c *Connection) GetArrayLength(id ArrayID) (int, error) {
-	var res int
-	err := c.get(cmdArrayReferenceLength, id, &res)
-	return res, err
+	return c.get[int](cmdArrayReferenceLength, id)
 }
 
 // GetArrayValues the values of the specified array.
@@ -28,9 +26,7 @@ func (c *Connection) GetArrayValues(id ArrayID, first, length int) ([]Value, err
 		First  int
 		Length int
 	}{id, first, length}
-	var res []Value
-	err := c.get(cmdArrayReferenceGetValues, req, &res)
-	return res, err
+	return c.get[[]Value](cmdArrayReferenceGetValues, req)
 }
 
 // SetArrayValues the values of the specified array.
@@ -40,5 +36,5 @@ func (c *Connection) SetArrayValues(id ArrayID, first int, values interface{}) e
 		First  int
 		Values interface{}
 	}{id, first, values}
-	return c.get(cmdArrayReferenceSetValues, req, nil)
+	return c.exec(cmdArrayReferenceSetValues, req)
 }

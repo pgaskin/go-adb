@@ -21,9 +21,7 @@ func (c *Connection) VariableTable(classTy ReferenceTypeID, method MethodID) (Va
 		Class  ReferenceTypeID
 		Method MethodID
 	}{classTy, method}
-	var res VariableTable
-	err := c.get(cmdMethodTypeVariableTable, req, &res)
-	return res, err
+	return c.get[VariableTable](cmdMethodTypeVariableTable, req)
 }
 
 func (c *Connection) LineTable(classTy ReferenceTypeID, method MethodID) (LineTable, error) {
@@ -31,7 +29,5 @@ func (c *Connection) LineTable(classTy ReferenceTypeID, method MethodID) (LineTa
 		Class  ReferenceTypeID
 		Method MethodID
 	}{classTy, method}
-	var res LineTable
-	err := c.get(cmdMethodTypeLineTable, req, &res)
-	return res, err
+	return c.get[LineTable](cmdMethodTypeLineTable, req)
 }

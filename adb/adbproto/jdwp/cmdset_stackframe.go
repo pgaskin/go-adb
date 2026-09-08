@@ -21,9 +21,7 @@ func (c *Connection) GetThisObject(thread ThreadID, frame FrameID) (TaggedObject
 		Thread ThreadID
 		Frame  FrameID
 	}{thread, frame}
-	res := TaggedObjectID{}
-	err := c.get(cmdStackFrameThisObject, req, &res)
-	return res, err
+	return c.get[TaggedObjectID](cmdStackFrameThisObject, req)
 }
 
 type VariableRequest struct {
@@ -40,9 +38,7 @@ func (c *Connection) GetValues(thread ThreadID, frame FrameID, slots []VariableR
 		Frame  FrameID
 		Slots  []VariableRequest
 	}{thread, frame, slots}
-	res := ValueSlice{}
-	err := c.get(cmdStackFrameGetValues, req, &res)
-	return res, err
+	return c.get[ValueSlice](cmdStackFrameGetValues, req)
 }
 
 type VariableAssignmentRequest struct {
@@ -58,6 +54,5 @@ func (c *Connection) SetValues(thread ThreadID, frame FrameID, slots []VariableA
 		Slots  []VariableAssignmentRequest
 	}{thread, frame, slots}
 
-	err := c.get(cmdStackFrameSetValues, req, nil)
-	return err
+	return c.exec(cmdStackFrameSetValues, req)
 }
