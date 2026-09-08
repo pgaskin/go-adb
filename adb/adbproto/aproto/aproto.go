@@ -472,6 +472,24 @@ func (c *Conn) Handshake(serverCert *tls.Certificate, verify func(peerCert *x509
 	return true
 }
 
+// HandshakeClient performs a TLS client handshake as a client. It should be
+// called after replying to the server's A_STLS packet. Like with A_AUTH
+// authentication, the server will send an A_CNXN packet after the handshake
+// completes if authentication was successful. Read and Write must not be called
+// concurrently.
+func (c *Conn) HandshakeClient(config *tls.Config) bool {
+	if c.Error() != nil {
+		return false
+	}
+	tlsconn := tls.Client(&fakeNetConn{c.rw}, config)
+	if err := tlsconn.Handshake(); err != nil {
+		c.setError(fmt.Errorf("tls: %w", err))
+		return false
+	}
+	c.rw = tlsconn
+	return true
+}
+
 // Error gets the error, if any. It can safely be called concurrently.
 func (c *Conn) Error() error {
 	c.errm.Lock()
