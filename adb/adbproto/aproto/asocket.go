@@ -178,7 +178,7 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 		}
 	} else {
 		// if delayed ack, send an okay with the amount we read
-		if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), binary.BigEndian.AppendUint32(nil, uint32(n))); err != nil {
+		if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), binary.LittleEndian.AppendUint32(nil, uint32(n))); err != nil {
 			return 0, fmt.Errorf("failed to ack data: %w", err)
 		}
 	}
