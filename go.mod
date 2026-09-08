@@ -1,6 +1,6 @@
 module github.com/pgaskin/go-adb
 
-go 1.24.0
+go 1.27.0
 
 tool google.golang.org/protobuf/cmd/protoc-gen-go
 
