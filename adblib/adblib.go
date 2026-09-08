@@ -4,8 +4,11 @@ package adblib
 import (
 	"cmp"
 	"context"
+	"crypto"
 
 	"github.com/pgaskin/go-adb/adb/adbhost"
+	"github.com/pgaskin/go-adb/adb/adbproto/atransport"
+	"github.com/pgaskin/go-adb/adb/adbtcpip"
 )
 
 // Connect connects to an ADB device through an ADB server. If addr is empty,
@@ -30,4 +33,30 @@ func Connect(ctx context.Context, addr, serial string) (*adbhost.TransportDialer
 		return nil, err
 	}
 	return srv, nil
+}
+
+// ConnectTCP connects directly to an ADB device listening on addr over TCP/IP
+// (i.e., `adb tcpip` or wireless debugging), authenticating with key (or the
+// user's ADB key if key is nil; see [adbhost.LoadUserKey]). If addr does not
+// contain a port, [adbtcpip.DefaultPort] is used. It waits for the connection
+// to be established.
+//
+// Note that if the key isn't authorized yet, this blocks until the user accepts
+// it on the device or ctx is done. For more control (e.g., multiple keys,
+// delayed acks, no waiting), use an [adbtcpip.Dialer] directly.
+func ConnectTCP(ctx context.Context, addr string, key crypto.Signer) (*atransport.Transport, error) {
+	key, err := userKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return (&adbtcpip.Dialer{
+		Config: &atransport.Config{Keys: []crypto.Signer{key}},
+	}).Connect(ctx, addr)
+}
+
+func userKey(key crypto.Signer) (crypto.Signer, error) {
+	if key != nil {
+		return key, nil
+	}
+	return adbhost.LoadUserKey()
 }
