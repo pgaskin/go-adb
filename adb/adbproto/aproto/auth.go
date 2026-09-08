@@ -1,6 +1,7 @@
 package aproto
 
 import (
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -58,10 +59,11 @@ func GenerateKey(random io.Reader) (*rsa.PrivateKey, error) {
 	return rsa.GenerateKey(random, PublicKeyModulusSize*8)
 }
 
-// GenerateCertificate generates a new certificate for an ADB daemon.
+// GenerateCertificate generates a new certificate for an ADB daemon or host
+// from the provided private key (usually an [*rsa.PrivateKey]).
 //
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/crypto/x509_generator.cpp;l=34-122;drc=61197364367c9e404c7da6900658f1b16c42d0da
-func GenerateCertificate(pkey *rsa.PrivateKey) ([]byte, error) {
+func GenerateCertificate(pkey crypto.Signer) ([]byte, error) {
 	cert := &x509.Certificate{
 		Version: 2,
 
@@ -81,5 +83,5 @@ func GenerateCertificate(pkey *rsa.PrivateKey) ([]byte, error) {
 		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		SubjectKeyId: []byte("hash"),
 	}
-	return x509.CreateCertificate(rand.Reader, cert, cert, &pkey.PublicKey, pkey)
+	return x509.CreateCertificate(rand.Reader, cert, cert, pkey.Public(), pkey)
 }
