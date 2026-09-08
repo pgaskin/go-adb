@@ -283,7 +283,8 @@ func (b *Banner) Decode(banner string) {
 // Conn is a low-level aproto connection. It does not handle connection state,
 // but it does parse A_CNXN.
 type Conn struct {
-	rw io.ReadWriter
+	rw     io.ReadWriter
+	closer io.Closer // the original underlying connection (rw may be swapped by the TLS handshake)
 
 	// connection state (populated by CNXN)
 	cmu  sync.Mutex
@@ -303,17 +304,33 @@ type Conn struct {
 }
 
 // New creates a new conn reading and writing to rw. It buffers its own input
-// and output.
+// and output. If rw implements [io.Closer], [Conn.Close] will call it.
 //
 // The transport should be kicked by closing its underlying connection if any
 // methods return an error.
 func New(rw io.ReadWriter) *Conn {
-	return &Conn{
+	c := &Conn{
 		rw: rw,
 
 		cmps: MaxPayloadSizeV1, // legacy v1 payload size until we know how much the remote can accept
 		cver: VersionMin,       // min protocol version to support
 	}
+	// keep the original closer so [Conn.Close] can interrupt it even after
+	// [Conn.Handshake]
+	if cl, ok := rw.(io.Closer); ok {
+		c.closer = cl
+	}
+	return c
+}
+
+// Close closes the underlying connection (if it implements [io.Closer]),
+// interrupting any blocked Read or Write. It is safe to call concurrently and
+// more than once.
+func (c *Conn) Close() error {
+	if c.closer != nil {
+		return c.closer.Close()
+	}
+	return nil
 }
 
 func (c *Conn) MaxPayloadSize() uint32 {
