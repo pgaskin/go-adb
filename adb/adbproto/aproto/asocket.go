@@ -172,9 +172,13 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 		copy(b[x:n], r.buf)
 	}
 	if r.DelayedAck == 0 {
-		// if not delayed ack, send an okay
-		if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), nil); err != nil {
-			return 0, fmt.Errorf("failed to ack data: %w", err)
+		// if not delayed ack, send an okay once we've consumed the entire
+		// packet (the peer will send another one as soon as we ack, and we
+		// only have room for one)
+		if r.len == n {
+			if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), nil); err != nil {
+				return 0, fmt.Errorf("failed to ack data: %w", err)
+			}
 		}
 	} else {
 		// if delayed ack, send an okay with the amount we read
