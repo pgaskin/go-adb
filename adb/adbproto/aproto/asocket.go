@@ -66,11 +66,6 @@ func (r *LocalSocket) Handle(pkt Packet) {
 		return // note: adb accepts legacy CLSE(0, remote-id) as a normal close for backwards compat
 	}
 
-	// check if closed
-	if r.closer.IsClosed() {
-		return
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -84,6 +79,15 @@ func (r *LocalSocket) Handle(pkt Packet) {
 		return
 	}
 
+	// if the read side is closed, discard the data, but still ack it so the
+	// peer doesn't block (like a TCP shutdown(SHUT_RD))
+	if r.closer.IsClosed() {
+		if !r.eof {
+			r.ack(len(pkt.Payload))
+		}
+		return
+	}
+
 	b := pkt.Payload
 	for len(b) != 0 {
 		// if delayed ack, wait for any amount of room to be available
@@ -93,6 +97,11 @@ func (r *LocalSocket) Handle(pkt Packet) {
 			select {
 			case <-r.closer.Closed():
 				r.mu.Lock()
+				// the read side was closed while we were waiting, so discard
+				// the rest of the packet (Close acks whatever was buffered)
+				if !r.eof {
+					r.ack(len(b))
+				}
 				return
 			case <-r.notifyRead:
 			}
@@ -170,18 +179,11 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 	if x < n {
 		copy(b[x:n], r.buf)
 	}
-	if r.DelayedAck == 0 {
-		// if not delayed ack, send an okay once we've consumed the entire
+	if r.DelayedAck != 0 || r.len == n {
+		// if not delayed ack, only send an okay once we've consumed the entire
 		// packet (the peer will send another one as soon as we ack, and we
 		// only have room for one)
-		if r.len == n {
-			if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), nil); err != nil {
-				return 0, fmt.Errorf("failed to ack data: %w", err)
-			}
-		}
-	} else {
-		// if delayed ack, send an okay with the amount we read
-		if err := r.Send(A_OKAY, uint32(r.Local), uint32(r.Remote), binary.LittleEndian.AppendUint32(nil, uint32(n))); err != nil {
+		if err := r.ack(n); err != nil {
 			return 0, fmt.Errorf("failed to ack data: %w", err)
 		}
 	}
@@ -219,14 +221,41 @@ func (r *LocalSocket) SetDeadline(t time.Time) {
 }
 
 // Close prevents future calls to Read and interrupts any pending ones, causing
-// them to return [net.ErrClosed]. It does not have any effect on the peer. It
-// wil never fail.
+// them to return [net.ErrClosed]. Data received from the peer afterwards is
+// discarded (but still acked, so the peer doesn't block). It blocks while
+// acking the remaining buffered data, if any. It will never fail.
 //
 // It is simlar to a TCP shutdown(SHUT_RD).
 func (r *LocalSocket) Close() error {
-	return r.closer.Close(func() error {
-		return nil
-	})
+	r.closer.Close(nil)
+
+	// discard any buffered data, acking it so the peer doesn't block waiting
+	// for it to be read (this must not be done while holding the closer lock
+	// since Read calls IsClosed while holding mu, and we don't hold mu while
+	// sending so we don't block Handle any longer than necessary)
+	r.mu.Lock()
+	n := r.len
+	if r.eof {
+		n = 0
+	}
+	r.len = 0
+	r.off = 0
+	r.mu.Unlock()
+
+	if n != 0 {
+		_ = r.ack(n) // ignore failures
+	}
+
+	return nil
+}
+
+// ack acks n bytes of data from the peer which have been consumed or discarded.
+// If not using delayed acks, it must be called exactly once per packet.
+func (r *LocalSocket) ack(n int) error {
+	if r.DelayedAck == 0 {
+		return r.Send(A_OKAY, r.Local, r.Remote, nil)
+	}
+	return r.Send(A_OKAY, r.Local, r.Remote, binary.LittleEndian.AppendUint32(nil, uint32(n)))
 }
 
 // RemoteSocket is a stream which writes to the aproto client (i.e., sends
