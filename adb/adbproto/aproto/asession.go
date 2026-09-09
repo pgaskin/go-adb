@@ -536,10 +536,13 @@ func (s *Session) handleOkay(msg Message, data []byte) {
 			delayedAck = binary.LittleEndian.Uint32(data)
 		}
 		if !s.connectPendingStream(msg.Arg1, msg.Arg0, delayedAck) {
-			// no matching connected or pending socket
+			// no matching connected or pending socket, so tell the peer to
+			// close it in case it's for a stream for which we timed out before
+			// the peer accepted it
 			if trace != nil && trace.PacketSocketUnknown != nil {
 				trace.PacketSocketUnknown(Packet{Message: msg, Payload: data})
 			}
+			s.Write(A_CLSE, msg.Arg1, msg.Arg0, nil)
 		}
 		return
 	}
