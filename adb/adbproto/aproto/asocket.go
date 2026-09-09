@@ -475,7 +475,7 @@ func LocalServiceSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteClose
 			// finish reading it)
 			err := rs.Close()
 			if err != nil {
-				err = fmt.Errorf("close remote socket: %q", err)
+				err = fmt.Errorf("close remote socket: %w", err)
 			}
 			rsCloseCh <- err
 		}()
