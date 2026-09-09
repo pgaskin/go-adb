@@ -508,10 +508,12 @@ func (s *Session) handleOpen(msg Message, data []byte) {
 		}
 
 		go func() {
-			if trace != nil && trace.LocalServiceClose != nil {
-				trace.LocalServiceSuccess(local, remote)
-			}
-			defer unregister()
+			defer func() {
+				unregister()
+				if trace != nil && trace.LocalServiceClose != nil {
+					trace.LocalServiceClose(local, remote)
+				}
+			}()
 
 			LocalServiceSocket(ls, rs, lss)
 		}()
