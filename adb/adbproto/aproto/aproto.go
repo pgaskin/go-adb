@@ -292,8 +292,9 @@ type Conn struct {
 	cver uint32
 
 	// read buffers
-	rmsg [MessageSize]byte
-	rbuf []byte
+	rmsg   [MessageSize]byte
+	rbuf   []byte
+	resync bool // skip data until a valid handshake packet header (see Resync)
 
 	// write buffers
 	wmsg [MessageSize]byte
@@ -345,6 +346,65 @@ func (c *Conn) ProtocolVersion() uint32 {
 	return c.cver
 }
 
+// resyncLimit is the maximum amount of data [Conn.Resync] will skip before
+// giving up and failing the connection. Stale data is bounded by whatever the
+// device had in flight when it received our A_CNXN (i.e., a few packets), so
+// anything more than this is probably not an ADB device at all.
+const resyncLimit = 16 * MaxPayloadSize
+
+// Resync makes the next Read skip any data (up to [resyncLimit] bytes) until it
+// finds a valid A_CNXN, A_AUTH, or A_STLS packet header, instead of failing on
+// an invalid one. It must be called before the first Read.
+//
+// This is intended for transports which can deliver stale data from a previous
+// connection, like USB, where the device has no way of knowing the host closed
+// the connection, so it keeps sending the rest of the packet it was in the
+// middle of (and any other packets for the streams it still has open) until it
+// receives our A_CNXN and resets them. Since those can only be A_CNXN, A_AUTH,
+// or A_STLS, and nothing else is expected at that point, this is safe.
+//
+// The one exception is if the previous connection was closed in the middle of
+// its handshake, in which case a stale A_AUTH (with the old token) may be
+// received before the reply to our A_CNXN. This is harmless since the device
+// will reject our signature of the old token and send a new one, so the
+// handshake just takes one more roundtrip.
+//
+// Note that this cannot resync cases where the peer is waiting for us to send
+// data (i.e., if we were interrupted mid-write) since we have no way of knowing
+// how much is left (see [SessionConfig.KickWriteTimeout] for that).
+//
+// This is non-standard behaviour, but is useful in some cases.
+func (c *Conn) Resync() {
+	c.resync = true
+}
+
+// isHandshakeHeader checks whether buf is a valid A_CNXN/A_AUTH/A_STLS header.
+func isHandshakeHeader(buf []byte) bool {
+	var msg Message
+	if err := msg.UnmarshalBinary(buf); err != nil || !msg.IsMagicValid() {
+		return false
+	}
+	switch msg.Command {
+	case A_CNXN, A_AUTH, A_STLS:
+		return msg.DataLength <= MaxPayloadSizeV1 // before negotiation
+	}
+	return false
+}
+
+// readFull reads exactly len(buf) bytes, setting the error and returning false
+// if it fails.
+func (c *Conn) readFull(buf []byte) bool {
+	if _, err := io.ReadFull(c.rw, buf); err != nil {
+		if err == io.EOF {
+			c.setError(errors.New("client kicked transport"))
+		} else {
+			c.setError(fmt.Errorf("read: %w", err))
+		}
+		return false
+	}
+	return true
+}
+
 // Read reads the next packet, blocking until it is received or an error occurs.
 // If an error occurs, false is returned and all future operations on c will
 // fail. Read must not be called concurrently with other calls to Read, and the
@@ -357,13 +417,23 @@ func (c *Conn) Read() (Message, []byte, bool) {
 	if n := int(c.MaxPayloadSize()); len(c.rbuf) != n {
 		c.rbuf = slices.Grow(c.rbuf[:0], n)[:n] // resize the buffer, but reuse the memory if possible
 	}
-	if _, err := io.ReadFull(c.rw, c.rmsg[:]); err != nil {
-		if err == io.EOF {
-			c.setError(errors.New("client kicked transport"))
-		} else {
-			c.setError(fmt.Errorf("read: %w", err))
-		}
+	if !c.readFull(c.rmsg[:]) {
 		return pkt.Message, pkt.Payload, false
+	}
+	if c.resync {
+		// skip stale data a byte at a time until we find a handshake packet
+		var skipped int
+		for !isHandshakeHeader(c.rmsg[:]) {
+			if skipped++; skipped > resyncLimit {
+				c.setError(fmt.Errorf("read: no handshake packet found in the first %d bytes", resyncLimit))
+				return pkt.Message, pkt.Payload, false
+			}
+			copy(c.rmsg[:], c.rmsg[1:])
+			if !c.readFull(c.rmsg[MessageSize-1:]) {
+				return pkt.Message, pkt.Payload, false
+			}
+		}
+		c.resync = false
 	}
 	if err := pkt.Message.UnmarshalBinary(c.rmsg[:]); err != nil {
 		c.setError(fmt.Errorf("read: %w", err))
@@ -378,12 +448,7 @@ func (c *Conn) Read() (Message, []byte, bool) {
 			c.setError(fmt.Errorf("read: payload too large (len=%d max=%d)", pkt.DataLength, len(c.rbuf)))
 			return pkt.Message, pkt.Payload, false
 		}
-		if _, err := io.ReadFull(c.rw, c.rbuf[:pkt.DataLength]); err != nil {
-			if err == io.EOF {
-				c.setError(errors.New("client kicked transport"))
-			} else {
-				c.setError(fmt.Errorf("read: %w", err))
-			}
+		if !c.readFull(c.rbuf[:pkt.DataLength]) {
 			return pkt.Message, pkt.Payload, false
 		}
 	}

@@ -16,15 +16,19 @@ import (
 // LocalSocket is a stream which reads from the aproto client (i.e., receives
 // A_WRTE/A_CLSE packets and sends A_OKAY ones). It is safe for concurrent use.
 //
+// Acks are sent with SendAsync, so neither Read nor Handle ever blocks on the
+// underlying connection.
+//
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
 type LocalSocket struct {
 	Local  uint32
 	Remote uint32
 
-	MaxPayload uint32                                                         // required
-	DelayedAck uint32                                                         // required, zero if delayed ack disabled
-	Send       func(cmd Command, arg0 uint32, arg1 uint32, data []byte) error // must be safe to be called concurrently
+	MaxPayload uint32                                                                                 // required
+	DelayedAck uint32                                                                                 // required, zero if delayed ack disabled
+	Send       func(cmd Command, arg0 uint32, arg1 uint32, data []byte, cancel <-chan struct{}) error // required, see [Session.Send]
+	SendAsync  func(cmd Command, arg0 uint32, arg1 uint32, data []byte)                               // required, see [Session.SendAsync]
 
 	deadline deadline
 	closer   closer
@@ -41,7 +45,7 @@ type LocalSocket struct {
 var _ io.ReadCloser = (*LocalSocket)(nil)
 
 func (r *LocalSocket) initLocked() {
-	if r.Local == 0 || r.Remote == 0 || r.MaxPayload == 0 || r.Send == nil {
+	if r.Local == 0 || r.Remote == 0 || r.MaxPayload == 0 || r.Send == nil || r.SendAsync == nil {
 		panic("local socket missing required fields")
 	}
 	if r.buf == nil {
@@ -181,9 +185,7 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 		// if not delayed ack, only send an okay once we've consumed the entire
 		// packet (the peer will send another one as soon as we ack, and we
 		// only have room for one)
-		if err := r.ack(n); err != nil {
-			return 0, fmt.Errorf("failed to ack data: %w", err)
-		}
+		r.ack(n)
 	}
 	r.len -= n
 	r.off += n
@@ -220,8 +222,8 @@ func (r *LocalSocket) SetDeadline(t time.Time) {
 
 // Close prevents future calls to Read and interrupts any pending ones, causing
 // them to return [net.ErrClosed]. Data received from the peer afterwards is
-// discarded (but still acked, so the peer doesn't block). It blocks while
-// acking the remaining buffered data, if any. It will never fail.
+// discarded (but still acked asynchronously, so the peer doesn't block). It
+// never blocks and will never fail.
 //
 // It is simlar to a TCP shutdown(SHUT_RD).
 func (r *LocalSocket) Close() error {
@@ -229,36 +231,36 @@ func (r *LocalSocket) Close() error {
 
 	// discard any buffered data, acking it so the peer doesn't block waiting
 	// for it to be read (this must not be done while holding the closer lock
-	// since Read calls IsClosed while holding mu, and we don't hold mu while
-	// sending so we don't block Handle any longer than necessary)
+	// since Read calls IsClosed while holding mu)
 	r.mu.Lock()
-	n := r.len
-	if r.eof {
-		n = 0
+	defer r.mu.Unlock()
+	if r.len != 0 && !r.eof {
+		r.ack(r.len)
 	}
 	r.len = 0
 	r.off = 0
-	r.mu.Unlock()
-
-	if n != 0 {
-		_ = r.ack(n) // ignore failures
-	}
 
 	return nil
 }
 
 // ack acks n bytes of data from the peer which have been consumed or discarded.
-// If not using delayed acks, it must be called exactly once per packet.
-func (r *LocalSocket) ack(n int) error {
+// If not using delayed acks, it must be called exactly once per packet. It
+// never blocks.
+func (r *LocalSocket) ack(n int) {
 	if r.DelayedAck == 0 {
-		return r.Send(A_OKAY, r.Local, r.Remote, nil)
+		r.SendAsync(A_OKAY, r.Local, r.Remote, nil)
+	} else {
+		r.SendAsync(A_OKAY, r.Local, r.Remote, binary.LittleEndian.AppendUint32(nil, uint32(n)))
 	}
-	return r.Send(A_OKAY, r.Local, r.Remote, binary.LittleEndian.AppendUint32(nil, uint32(n)))
 }
 
 // RemoteSocket is a stream which writes to the aproto client (i.e., sends
 // A_WRTE/A_CLSE packets and receives A_OKAY onces). It is safe for concurrent
 // use.
+//
+// Write releases the socket's mutex while sending, and Close sends with
+// SendAsync, so Handle never blocks on the underlying connection. Concurrent
+// writes may interleave at packet boundaries.
 //
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
@@ -266,9 +268,10 @@ type RemoteSocket struct {
 	Local  uint32
 	Remote uint32
 
-	MaxPayload uint32                                                         // required
-	DelayedAck uint32                                                         // required, zero if delayed ack disabled
-	Send       func(cmd Command, arg0 uint32, arg1 uint32, data []byte) error // must be safe to be called concurrently
+	MaxPayload uint32                                                                                 // required
+	DelayedAck uint32                                                                                 // required, zero if delayed ack disabled
+	Send       func(cmd Command, arg0 uint32, arg1 uint32, data []byte, cancel <-chan struct{}) error // required, see [Session.Send]
+	SendAsync  func(cmd Command, arg0 uint32, arg1 uint32, data []byte)                               // required, see [Session.SendAsync]
 
 	deadline deadline
 	closer   closer
@@ -283,7 +286,7 @@ type RemoteSocket struct {
 var _ io.WriteCloser = (*RemoteSocket)(nil)
 
 func (w *RemoteSocket) initLocked() {
-	if w.Local == 0 || w.Remote == 0 || w.MaxPayload == 0 || w.Send == nil {
+	if w.Local == 0 || w.Remote == 0 || w.MaxPayload == 0 || w.Send == nil || w.SendAsync == nil {
 		panic("remote socket missing required fields")
 	}
 	if w.notify == nil {
@@ -358,8 +361,10 @@ func (w *RemoteSocket) Handle(pkt Packet) {
 	}
 }
 
-// Write writes data to the stream. It returns the number of bytes written to
-// the stream. If err is nil, n == len(b).
+// Write writes data to the stream, blocking until it has been acked by the peer
+// (as required for flow control) and written to the underlying connection. It
+// returns the number of bytes written to the stream. If err is nil, n ==
+// len(b).
 func (w *RemoteSocket) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -373,6 +378,9 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 	var total int
 	for len(b) != 0 {
 		for {
+			if w.closer.IsClosed() {
+				return total, net.ErrClosed // don't send anything after the CLSE
+			}
 			if w.peerClosed {
 				return total, io.ErrClosedPipe
 			}
@@ -404,13 +412,29 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 		} else {
 			n = min(n, int(w.MaxPayload))
 		}
-		if err := w.Send(A_WRTE, uint32(w.Local), uint32(w.Remote), b[:n]); err != nil {
-			return total, fmt.Errorf("failed to write data: %w", err)
-		}
+
+		// reserve the flow control credit, then send without holding the
+		// mutex so Handle (i.e., the session's read loop) can still deliver
+		// acks while we're blocked on the underlying connection
 		if w.DelayedAck != 0 {
 			w.asb -= int64(n)
 		} else {
 			w.pkt--
+		}
+		w.mu.Unlock()
+		err := w.Send(A_WRTE, w.Local, w.Remote, b[:n], w.deadline.Done())
+		w.mu.Lock()
+		if err != nil {
+			if errors.Is(err, ErrSendCancelled) {
+				// it wasn't sent, so give the credit back
+				if w.DelayedAck != 0 {
+					w.asb += int64(n)
+				} else {
+					w.pkt++
+				}
+				return total, os.ErrDeadlineExceeded
+			}
+			return total, fmt.Errorf("failed to write data: %w", err)
 		}
 		b = b[n:]
 
@@ -421,14 +445,22 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 }
 
 // Close closes the stream. This preempts any writes which have not started yet
-// and causes them to return [net.ErrClosed]. It blocks until the A_CLOSE is
-// sent (it does not follow the write deadline). It causes the peer to detect an
-// EOF, after which the peer will send an A_CLSE back to close our local socket.
+// and causes them to return [net.ErrClosed]. The A_CLSE is queued after any
+// data which has already been written, and it returns without waiting for it
+// to be sent. It causes the peer to detect an EOF, after which the peer will
+// send an A_CLSE back to close our local socket. It will never fail.
 //
 // It is simlar to a TCP shutdown(SHUT_WR).
 func (w *RemoteSocket) Close() error {
 	return w.closer.Close(func() error {
-		return w.Send(A_CLSE, uint32(w.Local), uint32(w.Remote), nil)
+		// note: since this is queued rather than written synchronously, it
+		// will be dropped if the session is kicked before the writer gets to
+		// it (e.g., if the transport is closed right after the last stream
+		// is), but that's harmless since the peer closes all of the
+		// connection's streams when it disconnects anyway (use Session.Flush
+		// before kicking if it matters)
+		w.SendAsync(A_CLSE, w.Local, w.Remote, nil)
+		return nil
 	})
 }
 
@@ -436,8 +468,9 @@ func (w *RemoteSocket) Close() error {
 // write times out, it may return n > 0, indicating that some of the data was
 // successfully written. A zero value for t means Write will not time out.
 //
-// The deadline does not propagate to sending the data; it only affects the time
-// to wait for the peer to ack the previous data to make room.
+// The deadline covers waiting for the peer to ack the previous data to make
+// room, and waiting for the packet to start being written to the underlying
+// connection, but not the write itself once it has started.
 func (w *RemoteSocket) SetDeadline(t time.Time) {
 	w.deadline.Set(t)
 }

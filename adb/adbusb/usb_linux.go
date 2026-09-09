@@ -37,7 +37,9 @@ func init() {
 			return nil, err
 		}
 		var _ io.Closer = c // just to be sure
-		return aproto.New(c), nil
+		conn := aproto.New(c)
+		conn.Resync() // non-standard behaviour
+		return conn, nil
 	}
 	reset = func(d *DeviceInfo) error {
 		c, err := usbfsOpen(d)

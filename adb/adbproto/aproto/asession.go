@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pgaskin/go-adb/internal/util"
 )
@@ -51,6 +53,17 @@ type SessionConfig struct {
 	// SupportsDelayedAck should return true if the peer supports delayed acks.
 	// If nil, delayed acks are treated as unsupported.
 	SupportsDelayedAck func() bool
+
+	// KickWriteTimeout is how long [Session.Kick] waits for a packet which is
+	// currently being written to finish before closing the underlying
+	// connection anyway. If zero or negative, it doesn't wait.
+	//
+	// This should be set for transports which can't tell the peer that the
+	// connection was interrupted (e.g., USB), since the peer would otherwise
+	// wait forever for the rest of a partial packet (and then misinterpret the
+	// start of the next connection as the rest of it). It isn't needed for
+	// transports like TCP, where the peer sees the connection close.
+	KickWriteTimeout time.Duration
 }
 
 // SessionTrace is a set of hooks to run at various points in the lifecycle of a [Session].
@@ -61,8 +74,8 @@ type SessionConfig struct {
 // These hooks should not be used for important logic. They are intended for
 // debugging and metrics.
 type SessionTrace struct {
-	// PacketSent is called when a packet is about to be sent (it won't have the
-	// checksum, and may not be split yet).
+	// PacketSent is called when a packet is queued to be sent (it won't have
+	// the checksum, and may not be split yet).
 	PacketSent func(cmd Command, arg0, arg1 uint32, data []byte)
 
 	// PacketReceived is called when a packet is received.
@@ -128,9 +141,9 @@ type Session struct {
 	conn *Conn
 	cfg  SessionConfig
 
-	// set once by Serve before the loop starts (only read afterwards)
-	trace   *SessionTrace
-	dialCtx context.Context
+	// set by Serve before the loop starts
+	trace   atomic.Pointer[SessionTrace]
+	dialCtx context.Context // only used by the loop
 
 	// connection lifecycle
 	stateMu       sync.Mutex
@@ -139,7 +152,14 @@ type Session struct {
 	kicked        chan struct{}
 	kickErr       error
 
-	writeMu sync.Mutex // held while writing to conn (reading is single-threaded in Serve)
+	// outgoing packets (see Send)
+	writeMu     sync.Mutex // held while writing to conn (by the writer, or by a TLS handshake)
+	queueMu     sync.Mutex
+	queue       []*sessionPacket
+	queueReady  chan struct{} // poked (non-blocking) when a packet is queued
+	queueClosed bool          // set when the writer exits
+	queueErr    error
+	writerOnce  sync.Once
 
 	mu             sync.Mutex
 	streams        map[*sessionStream]struct{}
@@ -156,6 +176,7 @@ func NewSession(conn *Conn, cfg SessionConfig) *Session {
 		connected:     make(chan struct{}),
 		authenticated: make(chan struct{}),
 		kicked:        make(chan struct{}),
+		queueReady:    make(chan struct{}, 1),
 	}
 }
 
@@ -208,6 +229,16 @@ func (s *Session) SetAuthenticated() {
 // if it has not been kicked yet. It closes the underlying connection (which
 // interrupts [Session.Serve]) and all open streams. It is idempotent and safe
 // to call concurrently.
+//
+// It explicitly does not wait for queued packets (e.g., acks or A_CLSE packets
+// from closing streams) to be written first, since it is also used when the
+// connection is already broken. This is harmless for the peer (it closes all
+// of the connection's streams when it disconnects), but if it matters, call
+// [Session.Flush] first.
+//
+// If [SessionConfig.KickWriteTimeout] is set, it does wait (up to that long)
+// for a packet which is currently being written to finish, so the peer never
+// receives a partial packet.
 func (s *Session) Kick(err error) {
 	s.stateMu.Lock()
 	select {
@@ -223,7 +254,26 @@ func (s *Session) Kick(err error) {
 	close(s.kicked)
 	s.stateMu.Unlock()
 
-	s.conn.Close()
+	// close the connection at a packet boundary if enabled (see above), but
+	// don't wait forever since the write might be stuck because the peer isn't
+	// reading (in which case the only way to unblock it is to close the
+	// connection)
+	if s.cfg.KickWriteTimeout > 0 {
+		closed := make(chan struct{})
+		go func() {
+			s.writeMu.Lock()
+			defer s.writeMu.Unlock()
+			s.conn.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(s.cfg.KickWriteTimeout):
+			s.conn.Close()
+		}
+	} else {
+		s.conn.Close()
+	}
 
 	// close streams in a new goroutine, just in case anything is misbehaving
 	// (the local service conns come from user-provided implementations)
@@ -238,23 +288,181 @@ func (s *Session) MaxPayloadSize() uint32 { return s.conn.MaxPayloadSize() }
 // [Conn.ProtocolVersion].
 func (s *Session) ProtocolVersion() uint32 { return s.conn.ProtocolVersion() }
 
-// Write sends a packet, splitting the data if required. It holds the write lock
-// and is safe to call concurrently.
+// sessionPacket is a packet waiting to be written by the writer.
+type sessionPacket struct {
+	cmd        Command
+	arg0, arg1 uint32
+	data       []byte
+	done       chan error // receives the result (nil if nobody is waiting)
+	flush      bool       // if true, this isn't a real packet (see Flush)
+}
+
+// ErrSendCancelled is returned by [Session.Send] if the send is cancelled before
+// the packet has started being written.
+var ErrSendCancelled = errors.New("send cancelled")
+
+// Write sends a packet, splitting the data if required, blocking until it has
+// been written to the underlying connection (or the connection is kicked). It
+// is safe to call concurrently. It is equivalent to Send with a nil cancel.
 func (s *Session) Write(cmd Command, arg0, arg1 uint32, data []byte) error {
-	if s.trace != nil && s.trace.PacketSent != nil {
-		s.trace.PacketSent(cmd, arg0, arg1, data)
+	return s.Send(cmd, arg0, arg1, data, nil)
+}
+
+// Send sends a packet, splitting the data if required, blocking until it has
+// been written to the underlying connection, the connection is kicked, or
+// cancel is closed. If cancel is closed before the packet has started being
+// written, it is dropped and [ErrSendCancelled] is returned. Otherwise, it
+// blocks until the write finishes (a partially written packet can't be
+// interrupted without corrupting the stream). Data is not retained after it
+// returns. It is safe to call concurrently.
+//
+// Packets are written in the order they are sent, by a separate goroutine.
+// Since it blocks on the underlying connection, it must not be called from the
+// read loop (i.e., a [SessionConfig.Open] or [SessionTrace] callback), or while
+// holding a lock which the read loop needs, since that could deadlock if the
+// peer is also blocked writing to us (this doesn't currently happen with stock
+// ADB as of 2026-09-09, but could in other implementations, e.g., if the peer
+// is another go-adb Session and the underlying connection's buffers are full in
+// both directions). Use SendAsync for those instead. The Serve handshake
+// callback is the exception, since nothing else is happening at that point (and
+// the handshake packets are small enough to be buffered).
+func (s *Session) Send(cmd Command, arg0, arg1 uint32, data []byte, cancel <-chan struct{}) error {
+	p := &sessionPacket{cmd: cmd, arg0: arg0, arg1: arg1, data: data, done: make(chan error, 1)}
+	if err := s.enqueue(p); err != nil {
+		return err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if !s.conn.Write(cmd, arg0, arg1, data) {
-		return s.conn.Error()
+	select {
+	case err := <-p.done:
+		return err
+	case <-cancel:
+	}
+	if s.dequeue(p) {
+		return ErrSendCancelled
+	}
+	return <-p.done // it's already being written
+}
+
+// SendAsync queues a packet to be written in the background. It never blocks,
+// and copies data, so it is safe to call from the read loop or while holding
+// locks. Errors are not reported (they will kick the connection).
+func (s *Session) SendAsync(cmd Command, arg0, arg1 uint32, data []byte) {
+	s.enqueue(&sessionPacket{cmd: cmd, arg0: arg0, arg1: arg1, data: slices.Clone(data)})
+}
+
+// Flush blocks until all packets queued before it was called have been written
+// to the underlying connection, ctx is done, or the connection is kicked. Like
+// Send, it must not be called from the read loop.
+//
+// This is useful before kicking the connection to ensure the peer receives the
+// A_CLSE for any streams which were just closed (see [Session.Kick]).
+func (s *Session) Flush(ctx context.Context) error {
+	p := &sessionPacket{flush: true, done: make(chan error, 1)}
+	if err := s.enqueue(p); err != nil {
+		return err
+	}
+	select {
+	case err := <-p.done:
+		return err
+	case <-ctx.Done():
+		s.dequeue(p) // it doesn't matter if this fails
+		return ctx.Err()
+	}
+}
+
+// enqueue adds a packet to the write queue, starting the writer if necessary.
+func (s *Session) enqueue(p *sessionPacket) error {
+	if trace := s.trace.Load(); !p.flush && trace != nil && trace.PacketSent != nil {
+		trace.PacketSent(p.cmd, p.arg0, p.arg1, p.data)
+	}
+	s.queueMu.Lock()
+	if s.queueClosed {
+		s.queueMu.Unlock()
+		return s.queueErr
+	}
+	s.queue = append(s.queue, p)
+	s.queueMu.Unlock()
+	s.writerOnce.Do(func() {
+		go s.writer()
+	})
+	select {
+	case s.queueReady <- struct{}{}:
+	default:
 	}
 	return nil
 }
 
+// dequeue removes a packet from the write queue, returning false if it is not
+// there anymore (i.e., it is being or has been written, or the writer exited).
+func (s *Session) dequeue(p *sessionPacket) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	i := slices.Index(s.queue, p)
+	if i == -1 {
+		return false
+	}
+	s.queue = slices.Delete(s.queue, i, i+1)
+	return true
+}
+
+// writer writes queued packets until the connection is kicked or a write
+// fails, then fails any remaining and future packets.
+func (s *Session) writer() {
+	var err error
+	for {
+		s.queueMu.Lock()
+		if len(s.queue) == 0 {
+			s.queueMu.Unlock()
+			select {
+			case <-s.queueReady:
+				continue
+			case <-s.kicked:
+				err = s.err()
+			}
+			break
+		}
+		p := s.queue[0]
+		s.queue = slices.Delete(s.queue, 0, 1)
+		s.queueMu.Unlock()
+
+		if p.flush {
+			p.done <- nil // everything before it has been written
+			continue
+		}
+
+		s.writeMu.Lock()
+		ok := s.conn.Write(p.cmd, p.arg0, p.arg1, p.data)
+		s.writeMu.Unlock()
+
+		if !ok {
+			err = s.conn.Error()
+			if p.done != nil {
+				p.done <- err
+			}
+			s.Kick(err)
+			break
+		}
+		if p.done != nil {
+			p.done <- nil
+		}
+	}
+
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	s.queueClosed = true
+	s.queueErr = err
+	for _, p := range s.queue {
+		if p.done != nil {
+			p.done <- err
+		}
+	}
+	s.queue = nil
+}
+
 // Handshake performs a TLS server handshake, holding the write lock so it does
 // not interleave with any packet write. It should be called from the Serve
-// handshake callback in response to an A_STLS packet.
+// handshake callback in response to an A_STLS packet (after any packets sent
+// with Write have been written, which is always the case if they were sent from
+// the handshake callback).
 func (s *Session) Handshake(serverCert *tls.Certificate, verify func(peerCert *x509.Certificate)) bool {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -263,7 +471,7 @@ func (s *Session) Handshake(serverCert *tls.Certificate, verify func(peerCert *x
 
 // HandshakeClient performs a TLS client handshake, holding the write lock so it
 // does not interleave with any packet write. It should be called from the Serve
-// handshake callback after sending an A_STLS packet.
+// handshake callback after sending an A_STLS packet with Write.
 func (s *Session) HandshakeClient(config *tls.Config) bool {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -304,15 +512,16 @@ func isClosed(ch <-chan struct{}) bool {
 // It must be called at most once. If the loop needs to kick the connection, it
 // returns. The caller should call kick in a deferred call.
 func (s *Session) Serve(ctx context.Context, handshake func(msg Message, data []byte)) {
-	s.trace = sessionTrace(ctx)
+	s.trace.Store(sessionTrace(ctx))
 	s.dialCtx = ctx
 	for {
 		msg, data, ok := s.conn.Read()
 		if !ok {
 			return
 		}
-		if s.trace != nil && s.trace.PacketReceived != nil {
-			s.trace.PacketReceived(Packet{Message: msg, Payload: data})
+		trace := s.trace.Load()
+		if trace != nil && trace.PacketReceived != nil {
+			trace.PacketReceived(Packet{Message: msg, Payload: data})
 		}
 		switch msg.Command {
 		case A_CNXN, A_AUTH, A_STLS:
@@ -359,14 +568,14 @@ func (s *Session) Serve(ctx context.Context, handshake func(msg Message, data []
 			s.handleWrite(msg, data)
 
 		default:
-			if s.trace != nil && s.trace.PacketUnknown != nil {
-				s.trace.PacketUnknown(Packet{Message: msg, Payload: data})
+			if trace != nil && trace.PacketUnknown != nil {
+				trace.PacketUnknown(Packet{Message: msg, Payload: data})
 			}
 		}
 		continue
 	ignore:
-		if s.trace != nil && s.trace.PacketIgnored != nil {
-			s.trace.PacketIgnored(Packet{Message: msg, Payload: data})
+		if trace != nil && trace.PacketIgnored != nil {
+			trace.PacketIgnored(Packet{Message: msg, Payload: data})
 		}
 	}
 }
@@ -388,7 +597,8 @@ func (s *Session) DialADB(ctx context.Context, svc string) (net.Conn, error) {
 		Local:      local,
 		Remote:     0,
 		MaxPayload: s.conn.MaxPayloadSize(),
-		Send:       s.Write,
+		Send:       s.Send,
+		SendAsync:  s.SendAsync,
 	}
 	if s.supportsDelayedAck() {
 		ls.DelayedAck = s.cfg.LocalDelayedAck
@@ -397,7 +607,10 @@ func (s *Session) DialADB(ctx context.Context, svc string) (net.Conn, error) {
 	ch, remove := s.registerPendingStream(ls)
 	defer remove() // this only does something if it's still pending
 
-	if err := s.Write(A_OPEN, local, ls.DelayedAck, []byte(svc+"\x00")); err != nil {
+	if err := s.Send(A_OPEN, local, ls.DelayedAck, []byte(svc+"\x00"), ctx.Done()); err != nil {
+		if errors.Is(err, ErrSendCancelled) {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("send open: %w", err)
 	}
 
@@ -429,7 +642,7 @@ func (s *Session) DialADB(ctx context.Context, svc string) (net.Conn, error) {
 }
 
 func (s *Session) handleOpen(msg Message, data []byte) {
-	trace := s.trace
+	trace := s.trace.Load()
 
 	for len(data) > 0 && data[len(data)-1] == 0 {
 		data = data[:len(data)-1]
@@ -455,13 +668,13 @@ func (s *Session) handleOpen(msg Message, data []byte) {
 				if trace != nil && trace.LocalServiceFail != nil {
 					trace.LocalServiceFail(local, remote, errors.New("client requested delayed acks but didn't declare support for it"))
 				}
-				s.Write(A_CLSE, 0, msg.Arg0, nil)
+				s.SendAsync(A_CLSE, 0, msg.Arg0, nil)
 				return
 			}
 		}
 
 		if s.cfg.Open == nil {
-			s.Write(A_CLSE, 0, msg.Arg0, nil)
+			s.SendAsync(A_CLSE, 0, msg.Arg0, nil)
 			return
 		}
 
@@ -473,7 +686,7 @@ func (s *Session) handleOpen(msg Message, data []byte) {
 			if trace != nil && trace.LocalServiceFail != nil {
 				trace.LocalServiceFail(local, remote, err)
 			}
-			s.Write(A_CLSE, 0, msg.Arg0, nil)
+			s.SendAsync(A_CLSE, 0, msg.Arg0, nil)
 			return
 		}
 		if trace != nil && trace.LocalServiceSuccess != nil {
@@ -484,13 +697,15 @@ func (s *Session) handleOpen(msg Message, data []byte) {
 			Local:      local,
 			Remote:     remote,
 			MaxPayload: s.conn.MaxPayloadSize(),
-			Send:       s.Write,
+			Send:       s.Send,
+			SendAsync:  s.SendAsync,
 		}
 		rs := &RemoteSocket{
 			Local:      local,
 			Remote:     remote,
 			MaxPayload: s.conn.MaxPayloadSize(),
-			Send:       s.Write,
+			Send:       s.Send,
+			SendAsync:  s.SendAsync,
 		}
 		if s.cfg.DelayedAck && s.supportsDelayedAck() {
 			ls.DelayedAck = s.cfg.LocalDelayedAck
@@ -502,9 +717,9 @@ func (s *Session) handleOpen(msg Message, data []byte) {
 		unregister := s.registerSocket(ls, rs, lss)
 
 		if ls.DelayedAck != 0 {
-			s.Write(A_OKAY, local, remote, binary.LittleEndian.AppendUint32(nil, ls.DelayedAck))
+			s.SendAsync(A_OKAY, local, remote, binary.LittleEndian.AppendUint32(nil, ls.DelayedAck))
 		} else {
-			s.Write(A_OKAY, local, remote, nil)
+			s.SendAsync(A_OKAY, local, remote, nil)
 		}
 
 		go func() {
@@ -526,7 +741,7 @@ func (s *Session) handleOpen(msg Message, data []byte) {
 }
 
 func (s *Session) handleOkay(msg Message, data []byte) {
-	trace := s.trace
+	trace := s.trace.Load()
 
 	pair := s.findSocket(msg.Arg1, 0)
 	if pair == nil {
@@ -544,7 +759,7 @@ func (s *Session) handleOkay(msg Message, data []byte) {
 			if trace != nil && trace.PacketSocketUnknown != nil {
 				trace.PacketSocketUnknown(Packet{Message: msg, Payload: data})
 			}
-			s.Write(A_CLSE, msg.Arg1, msg.Arg0, nil)
+			s.SendAsync(A_CLSE, msg.Arg1, msg.Arg0, nil)
 		}
 		return
 	}
@@ -553,7 +768,7 @@ func (s *Session) handleOkay(msg Message, data []byte) {
 }
 
 func (s *Session) handleClose(msg Message, data []byte) {
-	trace := s.trace
+	trace := s.trace.Load()
 
 	pair := s.findSocket(msg.Arg1, msg.Arg0)
 	if pair == nil {
@@ -572,7 +787,7 @@ func (s *Session) handleClose(msg Message, data []byte) {
 }
 
 func (s *Session) handleWrite(msg Message, data []byte) {
-	trace := s.trace
+	trace := s.trace.Load()
 
 	pair := s.findSocket(msg.Arg1, msg.Arg0)
 	if pair == nil {
@@ -661,7 +876,8 @@ func (s *Session) connectPendingStream(local, remote, delayedAck uint32) bool {
 		Remote:     remote,
 		MaxPayload: s.conn.MaxPayloadSize(),
 		DelayedAck: delayedAck,
-		Send:       s.Write,
+		Send:       s.Send,
+		SendAsync:  s.SendAsync,
 	}
 
 	pending.ch <- &SocketPair{

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 	"github.com/pgaskin/go-adb/adb/adbproto/atransport"
@@ -185,6 +186,14 @@ func Reset(d Device) error {
 // current platform, [errors.ErrUnsupported] is returned. Pass a [*DeviceInfo]
 // to open it directly without enumerating all devices again. Note that a
 // running ADB daemon with USB enabled will conflict.
+//
+// USB has no way of telling the device that the host closed the connection, so
+// if the previous connection was closed in the middle of a packet, the device
+// will keep sending the rest of it (and anything else for the streams it still
+// has open) until it receives a new A_CNXN. The returned conn handles this by
+// skipping any data before the first handshake packet (see
+// [aproto.Conn.Resync]). The reverse direction (a packet being partially
+// written to the device) is handled by [DefaultKickWriteTimeout].
 func Open(d Device) (*aproto.Conn, error) {
 	if open == nil {
 		return nil, errors.ErrUnsupported
@@ -222,10 +231,21 @@ func resolve(d Device) (*DeviceInfo, error) {
 	return match, nil
 }
 
+// DefaultKickWriteTimeout is the default [atransport.Config.KickWriteTimeout]
+// used by [Dialer]. USB has no way to tell the device that the connection was
+// interrupted, so a partial packet would cause it to hang while waiting for the
+// rest of the payload (and then misinterpret the next A_CNXN as part of the
+// rest of it).
+//
+// Although a working device should finish reading within milliseconds, this is
+// set to a few seconds for robustness.
+const DefaultKickWriteTimeout = 5 * time.Second
+
 // Dialer connects to ADB devices over USB.
 type Dialer struct {
 	// Config is the transport configuration (keys, delayed acks, etc). It may
-	// be nil.
+	// be nil. If KickWriteTimeout is zero, [DefaultKickWriteTimeout] is used
+	// (set it to a negative value to disable it).
 	Config *atransport.Config
 }
 
@@ -240,11 +260,14 @@ func (dl *Dialer) Connect(ctx context.Context, d Device) (*atransport.Transport,
 	if err != nil {
 		return nil, err
 	}
-	var config *atransport.Config
-	if dl != nil {
-		config = dl.Config
+	var config atransport.Config
+	if dl != nil && dl.Config != nil {
+		config = *dl.Config
 	}
-	t, err := atransport.Connect(conn, config)
+	if config.KickWriteTimeout == 0 {
+		config.KickWriteTimeout = DefaultKickWriteTimeout
+	}
+	t, err := atransport.Connect(conn, &config)
 	if err != nil {
 		conn.Close()
 		return nil, err

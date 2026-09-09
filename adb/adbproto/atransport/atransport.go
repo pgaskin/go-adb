@@ -14,6 +14,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/pgaskin/go-adb/adb"
 	"github.com/pgaskin/go-adb/adb/adbproto"
@@ -61,7 +62,20 @@ type Config struct {
 	// Dialer, if non-nil, handles connections opened by the device (i.e.,
 	// reverse forwards). If nil, they are rejected.
 	Dialer adb.Dialer
+
+	// KickWriteTimeout is how long kicking the transport waits for a packet
+	// which is currently being written to finish before closing the connection
+	// anyway (see [aproto.SessionConfig.KickWriteTimeout]). If zero or
+	// negative, it doesn't wait. This should be set for transports which can't
+	// tell the device the connection was interrupted (e.g., USB).
+	KickWriteTimeout time.Duration
 }
+
+// TODO: should maybe consider getting rid of KickWriteTiemout and making the
+// layer under aproto.Conn (i.e., usbfs) responsible for emsuring stuff isn't
+// interrupted mid-packet, but then we'd need to fully assemble packets in
+// aproto.Conn instead of writing thr header and payload separately (which would
+// take additional memory for the buffer to copy the payload into)
 
 // Transport is a connection to an ADB server (i.e., device).
 type Transport struct {
@@ -142,6 +156,7 @@ func Connect(conn *aproto.Conn, config *Config) (*Transport, error) {
 		DelayedAck:         config.DelayedAck,
 		LocalDelayedAck:    uint32(localDelayedAck),
 		SupportsDelayedAck: func() bool { return t.SupportsFeature(adbproto.FeatureDelayedAck) },
+		KickWriteTimeout:   config.KickWriteTimeout,
 	})
 	go t.serve()
 	return t, nil
@@ -190,16 +205,43 @@ func (t *Transport) WaitConnected(ctx context.Context) error {
 	}
 }
 
+// ErrTransportClosed is the error streams see after the transport is closed
+// with [Transport.Close] or [Transport.Shutdown].
+var ErrTransportClosed = errors.New("transport closed")
+
 // Kick kicks the transport with the specified error (or a generic one if nil)
 // if the transport has not been kicked yet. This closes the underlying
-// connection.
+// connection without waiting for queued packets to be written (see
+// [Transport.Flush] and [Transport.Shutdown]).
 func (t *Transport) Kick(err error) {
 	t.sess.Kick(err)
 }
 
-// Close kicks the transport. It never returns an error.
+// Flush blocks until all queued packets have been written, ctx is done, or the
+// transport is kicked. It is the same as [aproto.Session.Flush].
+func (t *Transport) Flush(ctx context.Context) error {
+	return t.sess.Flush(ctx)
+}
+
+// Shutdown gracefully closes the transport. It closes all open streams, waits
+// for the resulting A_CLSE packets (and anything else queued) to be written or
+// for ctx to be done, then kicks the transport with [ErrTransportClosed].
+//
+// Unlike Close, this lets the device clean up its side of the streams right
+// away rather than when it sees the next connection. It returns the error from
+// waiting, if any, but the transport is kicked regardless.
+func (t *Transport) Shutdown(ctx context.Context) error {
+	t.sess.CloseStreams()
+	err := t.sess.Flush(ctx)
+	t.Kick(ErrTransportClosed)
+	return err
+}
+
+// Close kicks the transport with [ErrTransportClosed] immediately, without
+// waiting for queued packets to be written (see [Transport.Shutdown]). It never
+// returns an error.
 func (t *Transport) Close() error {
-	t.Kick(nil)
+	t.Kick(ErrTransportClosed)
 	return nil
 }
 

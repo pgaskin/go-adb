@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"maps"
 	mrand "math/rand/v2"
 	"net"
 	"slices"
@@ -334,17 +335,25 @@ func (s *Server) closeListeners() error {
 	return errors.Join(errs...)
 }
 
-func (s *Server) closeIdleConns() bool {
+func (s *Server) closeIdleConns(ctx context.Context) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	var active bool
+	var idle []*Transport
 	for t := range s.transports {
 		if !t.Idle() {
 			active = true
 			continue
 		}
-		t.Kick(ErrServerClosed)
+		idle = append(idle, t)
 		delete(s.transports, t)
+	}
+	s.mu.Unlock()
+
+	// give the transports a chance to send the A_CLSE for the streams which
+	// were just closed (since kicking doesn't wait for queued packets), but
+	// they're kicked regardless since it's harmless if they don't get through
+	for _, t := range idle {
+		t.Shutdown(ctx, ErrServerClosed)
 	}
 	return !active
 }
@@ -357,11 +366,19 @@ func (s *Server) Close() error {
 	s.listenerGroup.Wait()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for t := range s.transports {
-		t.Kick(ErrServerClosed)
-		delete(s.transports, t)
+	transports := slices.Collect(maps.Keys(s.transports))
+	clear(s.transports)
+	s.mu.Unlock()
+
+	// kick them in parallel and without holding the lock since Kick may block
+	// for a bit if a transport is in the middle of writing a packet
+	var wg sync.WaitGroup
+	for _, t := range transports {
+		wg.Go(func() {
+			t.Kick(ErrServerClosed)
+		})
 	}
+	wg.Wait()
 	return clerr
 }
 
@@ -386,7 +403,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	timer := time.NewTimer(nextPollInterval())
 	defer timer.Stop()
 	for {
-		if s.closeIdleConns() {
+		if s.closeIdleConns(ctx) {
 			return clerr
 		}
 		select {
@@ -505,9 +522,31 @@ func (t *Transport) Error() error {
 }
 
 // Kick kicks the transport with the specified error (or a generic one if nil)
-// if the transport has not been kicked yet. This closes the TCP connection.
+// if the transport has not been kicked yet. This closes the TCP connection
+// without waiting for queued packets to be written (see [Transport.Flush]).
 func (t *Transport) Kick(err error) {
 	t.sess.Kick(err)
+}
+
+// Flush blocks until all queued packets have been written, ctx is done, or the
+// transport is kicked. It is the same as [aproto.Session.Flush].
+func (t *Transport) Flush(ctx context.Context) error {
+	return t.sess.Flush(ctx)
+}
+
+// Shutdown gracefully kicks the transport with the specified error (or a
+// generic one if nil). It closes all open streams, waits for the resulting
+// A_CLSE packets (and anything else queued) to be written or for ctx to be
+// done, then kicks the transport.
+//
+// Unlike Kick, this lets the client clean up its side of the streams right away
+// rather than when it sees the connection close. It returns the error from
+// waiting, if any, but the transport is kicked regardless.
+func (t *Transport) Shutdown(ctx context.Context, err error) error {
+	t.sess.CloseStreams()
+	ferr := t.sess.Flush(ctx)
+	t.Kick(err)
+	return ferr
 }
 
 var (
