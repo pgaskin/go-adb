@@ -248,7 +248,7 @@ type RemoteSocket struct {
 
 	mu         sync.Mutex
 	notify     chan struct{}
-	asb        int32
+	asb        int64 // available send bytes (note: the initial window is unsigned, but acks are signed)
 	pkt        int
 	peerClosed bool
 }
@@ -262,7 +262,7 @@ func (w *RemoteSocket) initLocked() {
 	if w.notify == nil {
 		w.notify = make(chan struct{}, 1)
 		if w.DelayedAck != 0 {
-			w.asb = int32(w.DelayedAck)
+			w.asb = int64(w.DelayedAck)
 		} else {
 			w.pkt = 1
 		}
@@ -314,7 +314,7 @@ func (w *RemoteSocket) Handle(pkt Packet) {
 	w.initLocked()
 
 	if w.DelayedAck != 0 {
-		w.asb += acked
+		w.asb += int64(acked)
 		if w.asb <= 0 {
 			return
 		}
@@ -373,7 +373,7 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 
 		n := len(b)
 		if w.DelayedAck != 0 {
-			n = min(n, int(w.asb)) // note: Send will split it into multiple WRTE packets for us if it's greater than MaxPayload
+			n = int(min(int64(n), w.asb)) // note: Send will split it into multiple WRTE packets for us if it's greater than MaxPayload
 		} else {
 			n = min(n, int(w.MaxPayload))
 		}
@@ -381,7 +381,7 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 			return total, fmt.Errorf("failed to write data: %w", err)
 		}
 		if w.DelayedAck != 0 {
-			w.asb -= int32(n)
+			w.asb -= int64(n)
 		} else {
 			w.pkt--
 		}
