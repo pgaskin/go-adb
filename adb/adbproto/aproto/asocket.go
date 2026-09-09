@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-// TODO: actually test delayed acks
-
 // LocalSocket is a stream which reads from the aproto client (i.e., receives
 // A_WRTE/A_CLSE packets and sends A_OKAY ones). It is safe for concurrent use.
 //
