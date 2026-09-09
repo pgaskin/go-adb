@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/pgaskin/go-adb/adb/adbproto/aproto"
 	"github.com/pgaskin/go-adb/adb/adbproto/atransport"
 )
 
@@ -33,7 +34,7 @@ type Dialer struct {
 //
 // Note that if our key isn't authorized yet, this will block until the user
 // accepts it or ctx is done. To avoid waiting, use [atransport.Connect]
-// directly with a [net.Conn].
+// directly with an [aproto.Conn] created with a [net.Conn].
 func (d *Dialer) Connect(ctx context.Context, addr string) (*atransport.Transport, error) {
 	var dc func(ctx context.Context, network, addr string) (net.Conn, error)
 	var config *atransport.Config
@@ -55,7 +56,7 @@ func (d *Dialer) Connect(ctx context.Context, addr string) (*atransport.Transpor
 		return nil, err
 	}
 
-	t, err := atransport.Connect(conn, config)
+	t, err := atransport.Connect(aproto.New(conn), config)
 	if err != nil {
 		conn.Close()
 		return nil, err

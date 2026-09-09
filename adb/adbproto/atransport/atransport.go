@@ -81,9 +81,11 @@ type Transport struct {
 // banner and processing packets in a new goroutine. It returns without waiting
 // for the connection to be established (see [Transport.WaitConnected]).
 //
+// If conn is not created with an [io.Closer], kick will be a no-op.
+//
 // The transport takes ownership of conn, and will close it when the transport
 // is kicked.
-func Connect(conn io.ReadWriteCloser, config *Config) (*Transport, error) {
+func Connect(conn *aproto.Conn, config *Config) (*Transport, error) {
 	if config == nil {
 		config = &Config{}
 	}
@@ -135,7 +137,7 @@ func Connect(conn io.ReadWriteCloser, config *Config) (*Transport, error) {
 		}
 	}
 
-	t.sess = aproto.NewSession(aproto.New(conn), aproto.SessionConfig{
+	t.sess = aproto.NewSession(conn, aproto.SessionConfig{
 		Open:               dial,
 		DelayedAck:         config.DelayedAck,
 		LocalDelayedAck:    uint32(localDelayedAck),
