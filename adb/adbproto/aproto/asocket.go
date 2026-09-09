@@ -362,10 +362,10 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 			select {
 			case <-w.deadline.Done():
 				w.mu.Lock()
-				return 0, os.ErrDeadlineExceeded
+				return total, os.ErrDeadlineExceeded
 			case <-w.closer.Closed():
 				w.mu.Lock()
-				return 0, net.ErrClosed
+				return total, net.ErrClosed
 			case <-w.notify:
 			}
 			w.mu.Lock()
