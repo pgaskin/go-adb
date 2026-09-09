@@ -561,7 +561,9 @@ func (s *Session) handleClose(msg Message, data []byte) {
 		return
 	}
 
+	// closes both directions (the peer won't ack anything we write anymore)
 	pair.ls.Handle(Packet{Message: msg, Payload: data})
+	pair.rs.Handle(Packet{Message: msg, Payload: data})
 }
 
 func (s *Session) handleWrite(msg Message, data []byte) {

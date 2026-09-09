@@ -63,8 +63,8 @@ func (r *LocalSocket) Handle(pkt Packet) {
 	if pkt.Command != A_WRTE && pkt.Command != A_CLSE {
 		return
 	}
-	if r.Local != pkt.Arg1 || r.Remote != pkt.Arg0 {
-		return
+	if r.Local != pkt.Arg1 || !(r.Remote == pkt.Arg0 || (pkt.Command == A_CLSE && pkt.Arg0 == 0)) {
+		return // note: adb accepts legacy CLSE(0, remote-id) as a normal close for backwards compat
 	}
 
 	// check if closed
@@ -247,10 +247,11 @@ type RemoteSocket struct {
 	deadline deadline
 	closer   closer
 
-	mu     sync.Mutex
-	notify chan struct{}
-	asb    int32
-	pkt    int
+	mu         sync.Mutex
+	notify     chan struct{}
+	asb        int32
+	pkt        int
+	peerClosed bool
 }
 
 var _ io.WriteCloser = (*RemoteSocket)(nil)
@@ -273,11 +274,30 @@ func (w *RemoteSocket) initLocked() {
 // after returning. It must not be called concurrently (if you are trying to,
 // you are doing something wrong since an Conn's Read can't be used concurrently
 // either).
+//
+// An A_CLSE packet from the peer fails pending and future writes with
+// [io.ErrClosedPipe] since the peer will never ack them (an A_CLSE closes both
+// directions of the stream).
 func (w *RemoteSocket) Handle(pkt Packet) {
-	if pkt.Command != A_OKAY {
+	if pkt.Command != A_OKAY && pkt.Command != A_CLSE {
 		return
 	}
-	if w.Local != pkt.Arg1 || w.Remote != pkt.Arg0 {
+	if w.Local != pkt.Arg1 || !(w.Remote == pkt.Arg0 || (pkt.Command == A_CLSE && pkt.Arg0 == 0)) {
+		return // note: adb accepts legacy CLSE(0, remote-id) as a normal close for backwards compat
+	}
+
+	if pkt.Command == A_CLSE {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		w.initLocked()
+
+		w.peerClosed = true
+
+		select {
+		case w.notify <- struct{}{}:
+		default:
+		}
 		return
 	}
 
@@ -327,6 +347,9 @@ func (w *RemoteSocket) Write(b []byte) (int, error) {
 	var total int
 	for len(b) != 0 {
 		for {
+			if w.peerClosed {
+				return total, io.ErrClosedPipe
+			}
 			if w.DelayedAck != 0 {
 				if w.asb > 0 {
 					break
