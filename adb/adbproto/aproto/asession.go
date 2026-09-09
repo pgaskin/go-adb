@@ -143,7 +143,7 @@ type Session struct {
 
 	mu             sync.Mutex
 	streams        map[*sessionStream]struct{}
-	pendingStreams map[*LocalSocket]chan *RemoteSocket
+	pendingStreams map[uint32]*sessionPendingStream // by local socket id
 }
 
 // NewSession creates a Session with the provided config. It takes ownership of
@@ -401,32 +401,31 @@ func (s *Session) DialADB(ctx context.Context, svc string) (net.Conn, error) {
 		return nil, fmt.Errorf("send open: %w", err)
 	}
 
-	var rs *RemoteSocket
+	var pair *SocketPair
 	select {
 	case <-ctx.Done():
-	case remote := <-ch:
-		rs = remote
+	case pair = <-ch:
 	case <-s.kicked:
-		// check remote again to prevent racing
-		select {
-		default:
-			return nil, fmt.Errorf("kicked: %w", s.err())
-		case remote := <-ch:
-			rs = remote
-		}
 	}
-	if rs == nil {
+	if pair == nil && !remove() {
+		// the read loop connected or rejected the stream while we were giving
+		// up, so consume the result (this won't block since the result is sent
+		// while holding the lock which remove also takes)
+		pair = <-ch
+	}
+	if err := ctx.Err(); err != nil {
+		if pair != nil {
+			pair.Close() // tell the peer to go away
+		}
+		return nil, err
+	}
+	if pair == nil {
+		if isClosed(s.kicked) {
+			return nil, fmt.Errorf("kicked: %w", s.err())
+		}
 		return nil, fmt.Errorf("connection rejected by device")
 	}
-	ls.Remote = rs.Remote
-
-	unregister := s.registerSocket(ls, rs, nil)
-
-	return &SocketPair{
-		LS:      ls,
-		RS:      rs,
-		OnClose: unregister,
-	}, nil
+	return pair, nil
 }
 
 func (s *Session) handleOpen(msg Message, data []byte) {
@@ -529,26 +528,14 @@ func (s *Session) handleOkay(msg Message, data []byte) {
 
 	pair := s.findSocket(msg.Arg1, 0)
 	if pair == nil {
-		if ch := s.findPendingSocket(msg.Arg1); ch != nil {
-			// first OKAY, create the connection
-			var delayedAck uint32
-			if s.supportsDelayedAck() && len(data) == 4 {
-				delayedAck = binary.LittleEndian.Uint32(data)
-			}
-			rs := &RemoteSocket{
-				Local:      msg.Arg1,
-				Remote:     msg.Arg0,
-				MaxPayload: s.conn.MaxPayloadSize(),
-				DelayedAck: delayedAck,
-				Send:       s.Write,
-			}
-			select {
-			case ch <- rs:
-			default:
-				// DialADB isn't waiting anymore, close it immediately
-				rs.Close()
-			}
-		} else {
+		// first OKAY, connect the pending stream (this must be done before we
+		// read the next packet since the peer can send A_WRTE/A_CLSE for the
+		// new stream immediately)
+		var delayedAck uint32
+		if s.supportsDelayedAck() && len(data) == 4 {
+			delayedAck = binary.LittleEndian.Uint32(data)
+		}
+		if !s.connectPendingStream(msg.Arg1, msg.Arg0, delayedAck) {
 			// no matching connected or pending socket
 			if trace != nil && trace.PacketSocketUnknown != nil {
 				trace.PacketSocketUnknown(Packet{Message: msg, Payload: data})
@@ -565,14 +552,7 @@ func (s *Session) handleClose(msg Message, data []byte) {
 
 	pair := s.findSocket(msg.Arg1, msg.Arg0)
 	if pair == nil {
-		if ch := s.findPendingSocket(msg.Arg1); ch != nil {
-			// reject
-			select {
-			case ch <- nil:
-			default:
-				// DialADB isn't waiting anymore
-			}
-		} else {
+		if !s.rejectPendingStream(msg.Arg1) {
 			// no matching connected or pending socket
 			if trace != nil && trace.PacketSocketUnknown != nil {
 				trace.PacketSocketUnknown(Packet{Message: msg, Payload: data})
@@ -645,22 +625,69 @@ func (s *Session) findSocket(local, remote uint32) *sessionStream {
 	return nil
 }
 
-func (s *Session) findPendingSocket(local uint32) chan<- *RemoteSocket {
+// sessionPendingStream is a stream opened by DialADB which is waiting for the
+// peer to accept or reject it.
+type sessionPendingStream struct {
+	ls *LocalSocket
+	ch chan *SocketPair // buffered, receives exactly one value (nil if rejected)
+}
+
+// connectPendingStream registers a socket pair for the pending stream with the
+// specified local id (if any) and passes it to DialADB. The stream is
+// registered atomically so packets for it are routed correctly even if DialADB
+// hasn't returned yet.
+func (s *Session) connectPendingStream(local, remote, delayedAck uint32) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for stream, ch := range s.pendingStreams {
-		if stream.Local == local {
-			delete(s.pendingStreams, stream)
-			return ch
-		}
+
+	pending, ok := s.pendingStreams[local]
+	if !ok {
+		return false
 	}
-	return nil
+	delete(s.pendingStreams, local)
+
+	ls := pending.ls
+	ls.Remote = remote
+
+	rs := &RemoteSocket{
+		Local:      local,
+		Remote:     remote,
+		MaxPayload: s.conn.MaxPayloadSize(),
+		DelayedAck: delayedAck,
+		Send:       s.Write,
+	}
+
+	pending.ch <- &SocketPair{
+		LS:      ls,
+		RS:      rs,
+		OnClose: s.registerSocketLocked(ls, rs, nil),
+	}
+	return true
+}
+
+// rejectPendingStream tells DialADB that the pending stream with the specified
+// local id (if any) was rejected by the peer.
+func (s *Session) rejectPendingStream(local uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pending, ok := s.pendingStreams[local]
+	if !ok {
+		return false
+	}
+	delete(s.pendingStreams, local)
+
+	pending.ch <- nil
+	return true
 }
 
 func (s *Session) registerSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteCloser) (unregister func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.registerSocketLocked(ls, rs, lss)
+}
 
+func (s *Session) registerSocketLocked(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteCloser) (unregister func()) {
 	if s.streams == nil {
 		s.streams = make(map[*sessionStream]struct{})
 	}
@@ -682,21 +709,28 @@ func (s *Session) registerSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadW
 	}
 }
 
-func (s *Session) registerPendingStream(ls *LocalSocket) (remote <-chan *RemoteSocket, done func()) {
+// registerPendingStream registers ls as waiting for the peer to accept or
+// reject it. The result is sent on the returned channel. The returned remove
+// function removes the stream if it is still pending, returning true if so.
+func (s *Session) registerPendingStream(ls *LocalSocket) (result <-chan *SocketPair, remove func() bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.pendingStreams == nil {
-		s.pendingStreams = make(map[*LocalSocket]chan *RemoteSocket)
+		s.pendingStreams = make(map[uint32]*sessionPendingStream)
 	}
 
-	ch := make(chan *RemoteSocket, 1)
-	s.pendingStreams[ls] = ch
+	ch := make(chan *SocketPair, 1)
+	s.pendingStreams[ls.Local] = &sessionPendingStream{ls: ls, ch: ch}
 
-	return ch, func() {
+	return ch, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		delete(s.pendingStreams, ls)
+		if _, ok := s.pendingStreams[ls.Local]; !ok {
+			return false
+		}
+		delete(s.pendingStreams, ls.Local)
+		return true
 	}
 }
