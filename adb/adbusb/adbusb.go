@@ -138,6 +138,12 @@ func (d *DeviceInfo) String() string {
 // needed). To match ADB, the header must be written as one Write, then the
 // payload, split into multiple transfers if required (each with their own
 // header). The conn must implement Close. This is implemented by [aproto.Conn].
+//
+// Since adb 4af6e4ff (2024-09-30), ADB doesn't care about the header/payload
+// being submitted as individual bulk transfers and treats it as a stream
+// instead. Unfortunately, while it makes it more resilient to buggy hardware or
+// adb implementations, it means it can't recover itself if a write is
+// interrupted (it'll think the next CNXN was part of the packet).
 var (
 	enumerate func() ([]*DeviceInfo, error)
 	open      func(d *DeviceInfo) (*aproto.Conn, error)
