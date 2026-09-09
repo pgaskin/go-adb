@@ -49,8 +49,8 @@ func (r *LocalSocket) initLocked() {
 	}
 	if r.buf == nil {
 		r.buf = make([]byte, cmp.Or(r.DelayedAck, r.MaxPayload))
-		r.notifyData = make(chan struct{})
-		r.notifyRead = make(chan struct{})
+		r.notifyData = make(chan struct{}, 1)
+		r.notifyRead = make(chan struct{}, 1)
 	}
 }
 
