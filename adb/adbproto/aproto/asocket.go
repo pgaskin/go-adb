@@ -108,7 +108,7 @@ func (r *LocalSocket) Handle(pkt Packet) {
 		// copy data to the ring buffer
 		n := min(len(r.buf)-r.len, len(b))
 		o := r.off + r.len
-		if o > len(r.buf) {
+		if o >= len(r.buf) {
 			o -= len(r.buf)
 		}
 		x := copy(r.buf[o:], b[:n])
@@ -184,8 +184,8 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 	}
 	r.len -= n
 	r.off += n
-	if r.off > len(b) {
-		r.off -= len(b)
+	if r.off >= len(r.buf) {
+		r.off -= len(r.buf)
 	}
 
 	// wake up a blocked handle, if any
