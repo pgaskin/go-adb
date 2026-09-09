@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"os"
 	"sync"
@@ -514,13 +513,11 @@ func LocalServiceSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteClose
 
 // deadline implements stuff needed for deadlines on connection implementations.
 // It is safe for concurrent use.
-//
-// TODO: optimize this
 type deadline struct {
 	mu      sync.Mutex
-	timer   *time.Timer
-	notify  chan struct{}
-	cancel  chan struct{}
+	timer   *time.Timer   // pending timer, if any
+	seq     uint64        // incremented every time the deadline is set (so a late timer does nothing)
+	notify  chan struct{} // closed when the deadline elapses (nil until first use)
 	elapsed bool
 }
 
@@ -528,10 +525,10 @@ type deadline struct {
 func (d *deadline) Done() <-chan struct{} {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.notify != nil {
-		return d.notify
+	if d.notify == nil {
+		d.notify = make(chan struct{})
 	}
-	return d.setLocked(-1) // initialize with an infinite deadline
+	return d.notify
 }
 
 // Set sets the deadline to t. If t is in the past, the deadline is immediate.
@@ -556,36 +553,42 @@ func (d *deadline) SetTimeout(t time.Duration) {
 
 // setLocked sets the deadline to t. If t is negative, there is no deadline. The
 // mutex must be held while calling this.
-func (d *deadline) setLocked(t time.Duration) <-chan struct{} {
-	if d.timer == nil {
-		d.timer = time.NewTimer(math.MaxInt64)
+func (d *deadline) setLocked(t time.Duration) {
+	// invalidate the pending timer, if any (if it has already fired but hasn't
+	// acquired the mutex yet, it will see the new generation and do nothing)
+	d.seq++
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
 	}
-	d.timer.Stop()
+
+	// if the old deadline elapsed, start a new channel (the old one stays
+	// closed for anyone still holding it)
 	if d.notify == nil || d.elapsed {
-		if d.cancel != nil {
-			close(d.cancel)
-		}
-		c := make(chan struct{})
-		x := make(chan struct{})
-		go func() {
-			select {
-			case <-x:
-				return
-			case <-d.timer.C:
-			}
-			d.mu.Lock()
-			defer d.mu.Unlock()
-			d.elapsed = true
-			close(c)
-		}()
-		d.notify = c
-		d.cancel = x
+		d.notify = make(chan struct{})
 		d.elapsed = false
 	}
-	if t >= 0 {
-		d.timer.Reset(t)
+
+	switch {
+	case t < 0:
+		// no deadline
+	case t == 0:
+		d.elapsed = true
+		close(d.notify)
+	default:
+		seq := d.seq
+		// AfterFunc is cheap since Go 1.23
+		d.timer = time.AfterFunc(t, func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if d.seq != seq {
+				return
+			}
+			d.timer = nil
+			d.elapsed = true
+			close(d.notify)
+		})
 	}
-	return d.notify
 }
 
 // closer implements stuff needed for closing connection implementations.
