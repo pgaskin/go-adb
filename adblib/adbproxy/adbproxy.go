@@ -129,6 +129,27 @@ type Server struct {
 	// [ContextTransport].
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
+	// MaxQueuedPackets, if nonzero, limits the number of packets waiting to be
+	// written to a client before it is kicked. See
+	// [aproto.SessionConfig.MaxQueuedPackets].
+	//
+	// This is non-standard behaviour.
+	MaxQueuedPackets int
+
+	// WriteTimeout, if nonzero, kicks a client if a single packet takes longer
+	// than this to be written to it (i.e., it stopped reading). See
+	// [aproto.SessionConfig.WriteTimeout].
+	//
+	// This is non-standard behaviour.
+	WriteTimeout time.Duration
+
+	// MaxStreams, if nonzero, limits the number of streams a client may have
+	// open at once, rejecting ones past it. See
+	// [aproto.SessionConfig.MaxStreams].
+	//
+	// This is non-standard behaviour.
+	MaxStreams int
+
 	// OpenContext optionally specifies a function that modifies the context
 	// used for a new service connection c. The provided ctx is derived from the
 	// connection context. The context can be used with [ContextServer] and
@@ -478,6 +499,9 @@ func (s *Server) newTransport(conn net.Conn) *Transport {
 		DelayedAck:         s.DelayedAck,
 		LocalDelayedAck:    uint32(s.LocalDelayedAck),
 		SupportsDelayedAck: func() bool { return t.SupportsFeature(adbproto.FeatureDelayedAck) },
+		MaxQueuedPackets:   s.MaxQueuedPackets,
+		WriteTimeout:       s.WriteTimeout,
+		MaxStreams:         s.MaxStreams,
 	})
 	return t
 }

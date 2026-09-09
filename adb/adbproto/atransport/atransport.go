@@ -63,11 +63,34 @@ type Config struct {
 	// reverse forwards). If nil, they are rejected.
 	Dialer adb.Dialer
 
+	// MaxQueuedPackets, if nonzero, limits the number of packets waiting to be
+	// written before the transport is kicked. See
+	// [aproto.SessionConfig.MaxQueuedPackets].
+	//
+	// This is non-standard behaviour.
+	MaxQueuedPackets int
+
+	// WriteTimeout, if nonzero, kicks the transport if a single packet takes
+	// longer than this to be written (i.e., the device stopped reading). See
+	// [aproto.SessionConfig.WriteTimeout].
+	//
+	// This is non-standard behaviour.
+	WriteTimeout time.Duration
+
+	// MaxStreams, if nonzero, limits the number of streams open at once,
+	// rejecting ones opened by the device (i.e., reverse forwards) past it.
+	// See [aproto.SessionConfig.MaxStreams].
+	//
+	// This is non-standard behaviour.
+	MaxStreams int
+
 	// KickWriteTimeout is how long kicking the transport waits for a packet
 	// which is currently being written to finish before closing the connection
 	// anyway (see [aproto.SessionConfig.KickWriteTimeout]). If zero or
 	// negative, it doesn't wait. This should be set for transports which can't
 	// tell the device the connection was interrupted (e.g., USB).
+	//
+	// This is non-standard behaviour.
 	KickWriteTimeout time.Duration
 }
 
@@ -156,6 +179,9 @@ func Connect(conn *aproto.Conn, config *Config) (*Transport, error) {
 		DelayedAck:         config.DelayedAck,
 		LocalDelayedAck:    uint32(localDelayedAck),
 		SupportsDelayedAck: func() bool { return t.SupportsFeature(adbproto.FeatureDelayedAck) },
+		MaxQueuedPackets:   config.MaxQueuedPackets,
+		WriteTimeout:       config.WriteTimeout,
+		MaxStreams:         config.MaxStreams,
 		KickWriteTimeout:   config.KickWriteTimeout,
 	})
 	go t.serve()

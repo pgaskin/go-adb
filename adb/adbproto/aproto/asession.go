@@ -54,6 +54,42 @@ type SessionConfig struct {
 	// If nil, delayed acks are treated as unsupported.
 	SupportsDelayedAck func() bool
 
+	// MaxQueuedPackets, if nonzero, is the maximum number of packets which can
+	// be waiting to be written before the connection is kicked.
+	//
+	// For a well-behaved peer, the number of queued packets is bounded by the
+	// flow control (roughly one data packet per stream, plus a few control
+	// packets), so this only comes into play if the peer makes us generate
+	// packets (e.g., acks, or the A_CLSE replies to A_OKAY packets for unknown
+	// streams) faster than it reads them.
+	//
+	// Setting this to 16384 works fine for most situations.
+	//
+	// This is non-standard behaviour.
+	MaxQueuedPackets int
+
+	// WriteTimeout, if nonzero, is the maximum time a single packet may take to
+	// be written to the underlying connection before the connection is kicked.
+	// This protects against a peer which stops reading (e.g., a buggy or
+	// malicious one), which would otherwise leave the session (and anything
+	// blocked on writing to it) stuck forever.
+	//
+	// It should be set relatively high, since some transports may be slow and
+	// packets may be large.
+	//
+	// This is non-standard behaviour.
+	WriteTimeout time.Duration
+
+	// MaxStreams, if nonzero, is the maximum number of streams which may be
+	// open at once (including ones being opened, and ones we opened). Streams
+	// opened by the peer past this are rejected. This bounds the memory and
+	// goroutines a peer can make us use.
+	//
+	// Setting this to around a hundred works fine for typical usage.
+	//
+	// This is non-standard behaviour.
+	MaxStreams int
+
 	// KickWriteTimeout is how long [Session.Kick] waits for a packet which is
 	// currently being written to finish before closing the underlying
 	// connection anyway. If zero or negative, it doesn't wait.
@@ -61,8 +97,13 @@ type SessionConfig struct {
 	// This should be set for transports which can't tell the peer that the
 	// connection was interrupted (e.g., USB), since the peer would otherwise
 	// wait forever for the rest of a partial packet (and then misinterpret the
-	// start of the next connection as the rest of it). It isn't needed for
-	// transports like TCP, where the peer sees the connection close.
+	// start of the next connection as the rest of it). Setting this to a few
+	// seconds is more than enough for USB.
+	//
+	// It isn't needed for transports like TCP, where the peer sees the
+	// connection close.
+	//
+	// This is non-standard behaviour.
 	KickWriteTimeout time.Duration
 }
 
@@ -162,8 +203,9 @@ type Session struct {
 	writerOnce  sync.Once
 
 	mu             sync.Mutex
-	streams        map[*sessionStream]struct{}
+	streams        map[uint32]*sessionStream        // by local socket id
 	pendingStreams map[uint32]*sessionPendingStream // by local socket id
+	pendingOpens   int                              // streams being opened by the peer (counted against MaxStreams)
 }
 
 // NewSession creates a Session with the provided config. It takes ownership of
@@ -301,6 +343,10 @@ type sessionPacket struct {
 // the packet has started being written.
 var ErrSendCancelled = errors.New("send cancelled")
 
+// errQueueOverflow is the error the connection is kicked with if the write
+// queue overflows.
+var errQueueOverflow = errors.New("too many queued packets (peer isn't reading)")
+
 // Write sends a packet, splitting the data if required, blocking until it has
 // been written to the underlying connection (or the connection is kicked). It
 // is safe to call concurrently. It is equivalent to Send with a nil cancel.
@@ -379,6 +425,11 @@ func (s *Session) enqueue(p *sessionPacket) error {
 		s.queueMu.Unlock()
 		return s.queueErr
 	}
+	if s.cfg.MaxQueuedPackets > 0 && len(s.queue) >= s.cfg.MaxQueuedPackets {
+		s.queueMu.Unlock()
+		s.Kick(errQueueOverflow) // note: this is safe to call from anywhere enqueue is
+		return errQueueOverflow
+	}
 	s.queue = append(s.queue, p)
 	s.queueMu.Unlock()
 	s.writerOnce.Do(func() {
@@ -429,10 +480,22 @@ func (s *Session) writer() {
 			continue
 		}
 
+		// kick the connection if the write takes too long (see WriteTimeout),
+		// which unblocks it
+		var timeout *time.Timer
+		if s.cfg.WriteTimeout > 0 {
+			timeout = time.AfterFunc(s.cfg.WriteTimeout, func() {
+				s.Kick(fmt.Errorf("write timed out after %s (peer isn't reading)", s.cfg.WriteTimeout))
+			})
+		}
+
 		s.writeMu.Lock()
 		ok := s.conn.Write(p.cmd, p.arg0, p.arg1, p.data)
 		s.writeMu.Unlock()
 
+		if timeout != nil {
+			timeout.Stop()
+		}
 		if !ok {
 			err = s.conn.Error()
 			if p.done != nil {
@@ -649,11 +712,35 @@ func (s *Session) handleOpen(msg Message, data []byte) {
 	}
 	svc := string(data)
 
+	// check the stream limit (the pending open is counted until the stream is
+	// registered or fails)
+	if s.cfg.MaxStreams > 0 {
+		s.mu.Lock()
+		if len(s.streams)+s.pendingOpens >= s.cfg.MaxStreams {
+			s.mu.Unlock()
+			if trace != nil && trace.LocalServiceFail != nil {
+				trace.LocalServiceFail(0, msg.Arg0, fmt.Errorf("too many streams (max %d)", s.cfg.MaxStreams))
+			}
+			s.SendAsync(A_CLSE, 0, msg.Arg0, nil)
+			return
+		}
+		s.pendingOpens++
+		s.mu.Unlock()
+	}
+
 	fn := func() {
 		var (
 			local  = globalSocketAddr.Add(1)
 			remote = msg.Arg0
 		)
+
+		if s.cfg.MaxStreams > 0 {
+			defer func() {
+				s.mu.Lock()
+				s.pendingOpens--
+				s.mu.Unlock()
+			}()
+		}
 
 		sctx := s.dialCtx
 		if s.cfg.OpenContext != nil {
@@ -782,7 +869,7 @@ func (s *Session) handleClose(msg Message, data []byte) {
 	}
 
 	// closes both directions (the peer won't ack anything we write anymore)
-	pair.ls.Handle(Packet{Message: msg, Payload: data})
+	pair.ls.Handle(Packet{Message: msg, Payload: data}) // never fails for A_CLSE
 	pair.rs.Handle(Packet{Message: msg, Payload: data})
 }
 
@@ -797,7 +884,18 @@ func (s *Session) handleWrite(msg Message, data []byte) {
 		return
 	}
 
-	pair.ls.Handle(Packet{Message: msg, Payload: data})
+	if err := pair.ls.Handle(Packet{Message: msg, Payload: data}); err != nil {
+		// the peer sent more than it was allowed to, so the stream is broken
+		// (the reader will get the error once it consumes what was buffered),
+		// but the rest of the session is fine, so just close the stream
+		if trace != nil && trace.LocalServiceFail != nil {
+			trace.LocalServiceFail(pair.local, pair.remote, err)
+		}
+		pair.rs.Close() // sends the A_CLSE and fails pending writes
+		s.mu.Lock()
+		delete(s.streams, pair.local)
+		s.mu.Unlock()
+	}
 }
 
 // Idle returns true if the mux does not have any open streams.
@@ -814,7 +912,7 @@ func (s *Session) CloseStreams() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for stream := range s.streams {
+	for local, stream := range s.streams {
 		if stream.ls != nil {
 			stream.ls.Close()
 		}
@@ -824,7 +922,7 @@ func (s *Session) CloseStreams() {
 		if stream.lss != nil {
 			stream.lss.Close()
 		}
-		delete(s.streams, stream)
+		delete(s.streams, local)
 	}
 }
 
@@ -839,10 +937,8 @@ type sessionStream struct {
 func (s *Session) findSocket(local, remote uint32) *sessionStream {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for s := range s.streams {
-		if (remote == 0 || s.remote == remote) && s.local == local {
-			return s
-		}
+	if stream, ok := s.streams[local]; ok && (remote == 0 || stream.remote == remote) {
+		return stream
 	}
 	return nil
 }
@@ -912,7 +1008,7 @@ func (s *Session) registerSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadW
 
 func (s *Session) registerSocketLocked(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteCloser) (unregister func()) {
 	if s.streams == nil {
-		s.streams = make(map[*sessionStream]struct{})
+		s.streams = make(map[uint32]*sessionStream)
 	}
 
 	stream := &sessionStream{
@@ -922,13 +1018,15 @@ func (s *Session) registerSocketLocked(ls *LocalSocket, rs *RemoteSocket, lss io
 		rs:     rs,
 		lss:    lss,
 	}
-	s.streams[stream] = struct{}{}
+	s.streams[stream.local] = stream
 
 	return func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		delete(s.streams, stream)
+		if s.streams[stream.local] == stream {
+			delete(s.streams, stream.local)
+		}
 	}
 }
 

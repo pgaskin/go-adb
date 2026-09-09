@@ -13,11 +13,21 @@ import (
 	"time"
 )
 
+// ErrFlowControl is the error returned by [LocalSocket.Read] if the peer sent
+// more data than we allowed it to (i.e., it is buggy or malicious).
+//
+// This is non-standard behaviour (stock adb just breaks...).
+var ErrFlowControl = errors.New("peer violated flow control")
+
 // LocalSocket is a stream which reads from the aproto client (i.e., receives
 // A_WRTE/A_CLSE packets and sends A_OKAY ones). It is safe for concurrent use.
 //
-// Acks are sent with SendAsync, so neither Read nor Handle ever blocks on the
-// underlying connection.
+// Acks are sent with SendAsync, and Handle never waits for data to be read (a
+// peer which sends more than it is allowed to fails the stream instead), so
+// neither Read nor Handle ever blocks on the underlying connection or on user
+// code (which is what allows two sessions to be connected back-to-back without
+// deadlocking, and stops a misbehaving peer from stalling the session; see
+// [Session.Send]).
 //
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/sockets.cpp;drc=bef3d190db435c27fa76b9ed1b8d732de769ee1b
 // https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/adb/docs/dev/asocket.md;drc=2cbf5915385eb975e1cb07eb4605cd9a4f56f3c7
@@ -34,12 +44,12 @@ type LocalSocket struct {
 	closer   closer
 
 	mu         sync.Mutex
-	buf        []byte
-	off        int // start of data
-	len        int // length of data (wraps)
+	buf        []byte // ring buffer, grown on demand up to the window
+	off        int    // start of data
+	len        int    // length of data (wraps)
 	eof        bool
-	notifyData chan struct{}
-	notifyRead chan struct{}
+	err        error         // if non-nil, the reason for the eof (instead of io.EOF)
+	notifyData chan struct{} // 1-buffered, poked when data is added, closed on eof
 }
 
 var _ io.ReadCloser = (*LocalSocket)(nil)
@@ -48,24 +58,34 @@ func (r *LocalSocket) initLocked() {
 	if r.Local == 0 || r.Remote == 0 || r.MaxPayload == 0 || r.Send == nil || r.SendAsync == nil {
 		panic("local socket missing required fields")
 	}
-	if r.buf == nil {
-		r.buf = make([]byte, cmp.Or(r.DelayedAck, r.MaxPayload))
+	if r.notifyData == nil {
 		r.notifyData = make(chan struct{}, 1)
-		r.notifyRead = make(chan struct{}, 1)
 	}
+}
+
+// window returns the amount of data the peer is allowed to have in flight,
+// which is also the maximum size of the buffer.
+func (r *LocalSocket) window() int {
+	return int(cmp.Or(r.DelayedAck, r.MaxPayload))
 }
 
 // Handle handles a packet. It does not keep references to the packet payload
 // after returning. It must not be called concurrently (if you are trying to,
 // you are doing something wrong since an Conn's Read can't be used concurrently
-// either). It will block if it receives more A_WRTE packets than allowed given
-// the A_OKAY acks sent and the max payload size.
-func (r *LocalSocket) Handle(pkt Packet) {
+// either). It never blocks.
+//
+// If the peer sends more data than it is allowed to (i.e., before we ack the
+// previous packet if not using delayed acks, or more than the window if using
+// them), it returns [ErrFlowControl] and fails the stream (future reads return
+// the error once the buffered data is consumed). The caller should then close
+// the stream. This is non-standard, but better than simply breaking like stock
+// ADB.
+func (r *LocalSocket) Handle(pkt Packet) error {
 	if pkt.Command != A_WRTE && pkt.Command != A_CLSE {
-		return
+		return nil
 	}
 	if r.Local != pkt.Arg1 || !(r.Remote == pkt.Arg0 || (pkt.Command == A_CLSE && pkt.Arg0 == 0)) {
-		return // note: adb accepts legacy CLSE(0, remote-id) as a normal close for backwards compat
+		return nil // note: adb accepts legacy CLSE(0, remote-id) as a normal close for backwards compat
 	}
 
 	r.mu.Lock()
@@ -74,72 +94,87 @@ func (r *LocalSocket) Handle(pkt Packet) {
 	r.initLocked()
 
 	if pkt.Command == A_CLSE {
-		if !r.eof {
-			r.eof = true
-			close(r.notifyData) // wake up all pending and future readers
-		}
-		return
+		r.failLocked(nil)
+		return nil
+	}
+
+	if r.eof {
+		return nil // the peer already closed it (or we failed it)
 	}
 
 	// if the read side is closed, discard the data, but still ack it so the
 	// peer doesn't block (like a TCP shutdown(SHUT_RD))
 	if r.closer.IsClosed() {
-		if !r.eof {
-			r.ack(len(pkt.Payload))
-		}
-		return
+		r.ack(len(pkt.Payload))
+		return nil
 	}
 
+	// check the flow control (if not using delayed acks, the peer must wait
+	// for us to ack the previous packet, which we only do once it has been
+	// consumed entirely, so the buffer must be empty)
 	b := pkt.Payload
-	for len(b) != 0 {
-		// if delayed ack, wait for any amount of room to be available
-		// if not delayed ack, wait for the buffer to be drained
-		for ((r.DelayedAck != 0 && len(r.buf)-r.len == 0) || (r.DelayedAck == 0 && r.len != 0)) && !r.eof {
-			r.mu.Unlock()
-			select {
-			case <-r.closer.Closed():
-				r.mu.Lock()
-				// the read side was closed while we were waiting, so discard
-				// the rest of the packet (Close acks whatever was buffered)
-				if !r.eof {
-					r.ack(len(b))
-				}
-				return
-			case <-r.notifyRead:
-			}
-			r.mu.Lock()
-		}
+	if (r.DelayedAck == 0 && r.len != 0) || len(b) > r.window()-r.len {
+		// instead of allowing the client to make the entire session read loop
+		// fail, make the reader get ErrFlowControl after any remaining data,
+		// who can then send an A_CLSE to the peer for the stream (allowing the
+		// underlying session/transport to continue working properly)
+		r.failLocked(ErrFlowControl)
+		return ErrFlowControl
+	}
 
-		// handle eof (it could have changed while we were waiting)
-		if r.eof {
-			return
-		}
+	// grow the buffer if needed (it starts out empty so we don't allocate the
+	// entire window for every stream up front)
+	if need := r.len + len(b); need > len(r.buf) {
+		r.growLocked(need)
+	}
 
-		// copy data to the ring buffer
-		n := min(len(r.buf)-r.len, len(b))
-		o := r.off + r.len
-		if o >= len(r.buf) {
-			o -= len(r.buf)
-		}
-		x := copy(r.buf[o:], b[:n])
-		if x < n {
-			copy(r.buf, b[x:n])
-		}
-		r.len += n
-		b = b[n:]
+	// copy data to the ring buffer
+	o := r.off + r.len
+	if o >= len(r.buf) {
+		o -= len(r.buf)
+	}
+	x := copy(r.buf[o:], b)
+	if x < len(b) {
+		copy(r.buf, b[x:])
+	}
+	r.len += len(b)
 
-		// wake up another pending reader, if any (the !r.eof check is critical,
-		// otherwise we may double-close the channel for a partial read after
-		// eof)
-		select {
-		case r.notifyData <- struct{}{}:
-		default:
+	// wake up a pending reader, if any
+	select {
+	case r.notifyData <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// growLocked grows the buffer to hold at least need bytes (which must not be
+// more than the window), preserving the buffered data.
+func (r *LocalSocket) growLocked(need int) {
+	size := max(need, min(2*len(r.buf), r.window()))
+	buf := make([]byte, size)
+	if r.len != 0 {
+		x := copy(buf, r.buf[r.off:min(r.off+r.len, len(r.buf))])
+		if x < r.len {
+			copy(buf[x:], r.buf[:r.len-x])
 		}
+	}
+	r.buf = buf
+	r.off = 0
+}
+
+// failLocked marks the stream as ended (with err, or io.EOF if nil), waking up
+// all pending and future readers.
+func (r *LocalSocket) failLocked(err error) {
+	if !r.eof {
+		r.eof = true
+		r.err = err
+		close(r.notifyData)
 	}
 }
 
 // Read reads data from the stream up to len(b), returning the number of bytes
-// read (n > 0). On EOF, it returns (0, io.EOF).
+// read (n > 0). On EOF, it returns (0, io.EOF), or (0, [ErrFlowControl]) if the
+// peer misbehaved.
 func (r *LocalSocket) Read(b []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -172,6 +207,9 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 
 	// handle eof
 	if r.len == 0 && r.eof {
+		if r.err != nil {
+			return 0, r.err
+		}
 		return 0, io.EOF
 	}
 
@@ -191,12 +229,6 @@ func (r *LocalSocket) Read(b []byte) (int, error) {
 	r.off += n
 	if r.off >= len(r.buf) {
 		r.off -= len(r.buf)
-	}
-
-	// wake up a blocked handle, if any
-	select {
-	case r.notifyRead <- struct{}{}:
-	default:
 	}
 
 	// wake up another pending reader, if any (the !r.eof check is critical,
@@ -222,8 +254,8 @@ func (r *LocalSocket) SetDeadline(t time.Time) {
 
 // Close prevents future calls to Read and interrupts any pending ones, causing
 // them to return [net.ErrClosed]. Data received from the peer afterwards is
-// discarded (but still acked asynchronously, so the peer doesn't block). It
-// never blocks and will never fail.
+// discarded (but still acked, so the peer doesn't block). It never blocks and
+// will never fail.
 //
 // It is simlar to a TCP shutdown(SHUT_RD).
 func (r *LocalSocket) Close() error {
@@ -237,6 +269,7 @@ func (r *LocalSocket) Close() error {
 	if r.len != 0 && !r.eof {
 		r.ack(r.len)
 	}
+	r.buf = nil
 	r.len = 0
 	r.off = 0
 
@@ -504,7 +537,7 @@ func LocalServiceSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteClose
 			}
 			lssCloseCh <- err
 		}()
-		b := make([]byte, cmp.Or(ls.DelayedAck, ls.MaxPayload))
+		b := make([]byte, ls.MaxPayload) // note: not the delayed ack window, which is way bigger than necessary
 		for {
 			nr, err := ls.Read(b)
 			if err == io.EOF {
@@ -539,7 +572,7 @@ func LocalServiceSocket(ls *LocalSocket, rs *RemoteSocket, lss io.ReadWriteClose
 			}
 			rsCloseCh <- err
 		}()
-		b := make([]byte, cmp.Or(rs.DelayedAck, rs.MaxPayload))
+		b := make([]byte, rs.MaxPayload) // note: not the delayed ack window, which is way bigger than necessary
 		for {
 			nr, err := lss.Read(b)
 			if err == io.EOF {
