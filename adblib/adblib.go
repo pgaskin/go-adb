@@ -9,6 +9,7 @@ import (
 	"github.com/pgaskin/go-adb/adb/adbhost"
 	"github.com/pgaskin/go-adb/adb/adbproto/atransport"
 	"github.com/pgaskin/go-adb/adb/adbtcpip"
+	"github.com/pgaskin/go-adb/adb/adbusb"
 )
 
 // Connect connects to an ADB device through an ADB server. If addr is empty,
@@ -52,6 +53,27 @@ func ConnectTCP(ctx context.Context, addr string, key crypto.Signer) (*atranspor
 	return (&adbtcpip.Dialer{
 		Config: &atransport.Config{Keys: []crypto.Signer{key}},
 	}).Connect(ctx, addr)
+}
+
+// ConnectUSB connects directly to a USB ADB device, authenticating with key (or
+// the user's ADB key if key is nil; see [adbhost.LoadUserKey]). If serial is
+// empty, [adbusb.Any] is used. It waits for the connection to be established.
+//
+// Note that if the key isn't authorized yet, this blocks until the user accepts
+// it on the device or ctx is done. For more control (e.g., multiple keys, other
+// device selectors, delayed acks, no waiting), use an [adbusb.Dialer] directly.
+func ConnectUSB(ctx context.Context, serial string, key crypto.Signer) (*atransport.Transport, error) {
+	key, err := userKey(key)
+	if err != nil {
+		return nil, err
+	}
+	dev := adbusb.Any
+	if serial != "" {
+		dev = adbusb.Serial(serial)
+	}
+	return (&adbusb.Dialer{
+		Config: &atransport.Config{Keys: []crypto.Signer{key}},
+	}).Connect(ctx, dev)
 }
 
 func userKey(key crypto.Signer) (crypto.Signer, error) {
